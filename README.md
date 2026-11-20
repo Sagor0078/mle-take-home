@@ -1,5 +1,134 @@
 # MLE Take-Home: Company Recommendation System
 
+## Running the solution
+
+This repo now contains a consumer that reads `company-events` into Postgres/pgvector and a FastAPI service that
+returns similar companies. Why it is built this way, what was assumed, how it is tested and what is left are in
+[`DESIGN.md`](DESIGN.md). The original assignment text is kept unchanged [below](#the-assignment-original-brief).
+
+### Prerequisites
+
+- Docker, [uv](https://docs.astral.sh/uv/) and [just](https://github.com/casey/just), as in the original brief.
+- A **final** Python 3.14 release. Older uv versions install 3.14.0rc2, on which pydantic (and so FastAPI) fails to
+  import. If `uv run python --version` prints an `rc`, run `uv self update && uv python install 3.14`, then
+  `rm -rf .venv && just setup`. Tested with uv 0.13.9 and Python 3.14.10.
+- About 70 MB of free disk and network access the first time the consumer starts: it downloads the embedding model
+  `BAAI/bge-small-en-v1.5` (~67 MB) through fastembed.
+
+### Run it
+
+```bash
+just setup      # uv sync --locked: installs all dependencies
+just up         # Postgres (pgvector) + RabbitMQ, waits until healthy
+just migrate    # optional: the consumer also applies migrations when it starts
+just consume    # terminal 1: runs until Ctrl-C
+just publish    # terminal 2: puts the 2,518-message feed on the queue
+just serve      # terminal 3: API on http://localhost:8000 (API_PORT to change)
+```
+
+`just consume` applies the migrations, loads the model, declares `company-events` exactly as the registry team does
+(durable, no arguments) and processes messages until you press Ctrl-C. It logs a running total every 500 messages, and
+on Ctrl-C it waits for in-flight messages and prints the totals. For one publish of the feed that is:
+
+```
+final counts: applied=2433 duplicate=68 rejected=17 requeued=0
+```
+
+Running `just publish` again is safe: every message is then a `duplicate` and the database does not change.
+Rejected messages are kept, with the reason, in the `rejected_messages` table.
+
+`just serve` does **not** apply migrations. Start the consumer (or run `just migrate`) at least once before it;
+`GET /readyz` returns 503 until the schema exists.
+
+### Try it
+
+```bash
+curl -s localhost:8000/companies/SYN-001550/similar | python -m json.tool
+```
+
+Response from a database filled by the steps above (scores shortened here to 3 decimals; the API returns full floats):
+
+```json
+{
+  "company": {"registrationNumber": "SYN-001550", "name": "Sinar Teguh Bakery Sdn. Bhd.",
+              "industry": "Food & Beverage", "state": "Selangor", "status": "active"},
+  "similar": [
+    {"registrationNumber": "SYN-000539", "name": "Seri Sejahtera Food Sdn. Bhd.",
+     "industry": "Food & Beverage", "state": "Johor", "status": "active", "score": 1.0},
+    {"registrationNumber": "SYN-000263", "name": "Gemilang Delima Food Sdn. Bhd.",
+     "industry": "Food & Beverage", "state": "Johor", "status": "active", "score": 0.834},
+    {"registrationNumber": "SYN-001650", "name": "Everbright Pacific Food Sdn. Bhd.",
+     "industry": "Food & Beverage", "state": "Kuala Lumpur", "status": "active", "score": 0.834},
+    {"registrationNumber": "SYN-000700", "name": "Teguh Mega Logistik Trading",
+     "industry": "Logistics", "state": "Selangor", "status": "active", "score": 0.830}
+  ],
+  "reason": null,
+  "model": "BAAI/bge-small-en-v1.5"
+}
+```
+
+Other endpoints and cases:
+
+| Request | Status | Body |
+|---|---|---|
+| `GET /companies/SYN-001550/similar?limit=8` | 200 | as above, up to 8 results (`limit` 1–20, default 4) |
+| `GET /companies/syn-001550` | 200 | the card for the page itself (reg. no. is normalised) |
+| `GET /companies/SYN-000186/similar` | 200 | struck-off company: `"status": "struck_off"`, `"similar": []`, `"reason": "struck_off"` |
+| `GET /companies/SYN-000048/similar` | 200 | no description and no industry: `"similar": []`, `"reason": "no_description"` |
+| `GET /companies/SYN-999999/similar` | 404 | `{"error": "company_not_found"}` |
+| `GET /companies/hello/similar` | 422 | `{"error": "invalid_registration_number"}` |
+| `GET /healthz`, `GET /readyz` | 200 / 503 | process up; database reachable and migrated |
+
+Interactive docs are at http://localhost:8000/docs.
+
+### Tests
+
+```bash
+just up         # the tests need the Postgres container (not RabbitMQ)
+just test       # 127 tests, about a minute
+```
+
+The tests create a throwaway database `companies_test_<hex>` on the same Postgres server and drop it at the end, so
+they do not touch the `companies` database. They never download a model: they use a deterministic hashed
+bag-of-words embedder. What each test file covers is in [`DESIGN.md`](DESIGN.md#5-testing).
+
+### Configuration
+
+Everything has a default that matches `docker-compose.yml`. Set variables in your shell or in a local `.env` file
+(git-ignored); the Justfile loads `.env` (`set dotenv-load`), so `docker compose` and the app see the same values.
+
+| Variable | Default | Used by |
+|---|---|---|
+| `POSTGRES_PORT` | `5432` | compose, and the default `DATABASE_URL` |
+| `RABBITMQ_PORT` | `5672` | compose, `just publish`, and the default `RABBITMQ_URL` |
+| `RABBITMQ_UI_PORT` | `15672` | compose (management UI) |
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:$POSTGRES_PORT/companies` | consumer, API, migrate, tests |
+| `RABBITMQ_URL` | `amqp://guest:guest@localhost:$RABBITMQ_PORT/` | consumer, producer |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | consumer (any 384-dim fastembed model); API reports it as `model` |
+| `PREFETCH` | `32` | consumer: unacked messages in flight |
+| `API_PORT` | `8000` | `just serve` |
+
+If the default ports are taken on your machine, for example:
+
+```bash
+printf 'POSTGRES_PORT=5435\nRABBITMQ_PORT=5673\nRABBITMQ_UI_PORT=15673\n' > .env
+```
+
+### Layout
+
+```
+app/          config, db (pool), migrate, events (parse/normalise), text (description cleaning),
+              embedding, store (all SQL), ingest (one message = one transaction), consumer, api
+migrations/   001_init.sql
+tests/        unit tests for parsing/text/embedding; integration tests against Postgres
+DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use
+```
+
+---
+
+## The assignment (original brief)
+
+
 Welcome to the **Machine Learning Engineer** take-home from the OneCredit Data & AI team. It's a simplified version of
 a system we run in production, where it powers company recommendations and lead generation.
 

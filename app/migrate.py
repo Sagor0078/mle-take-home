@@ -1,41 +1,73 @@
-"""Apply the SQL files in migrations/ in name order, once each."""
+"""Schema migrations through Alembic (revisions live in migrations/versions/)."""
 
-import asyncio
 from pathlib import Path
 
 import psycopg
+from alembic import command
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from psycopg.conninfo import conninfo_to_dict
+from sqlalchemy.engine import URL
 
 from app.config import Settings
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+ROOT = Path(__file__).resolve().parent.parent
 
 
-async def migrate(conn: psycopg.AsyncConnection) -> list[str]:
-    """Apply unapplied migrations (autocommit connection) and return their names."""
-    await conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations "
-        "(name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
+def sqlalchemy_url(database_url: str) -> str:
+    """The same database as a SQLAlchemy URL with the psycopg 3 driver, as Alembic needs it.
+
+    Accepts anything libpq does: postgres:// and postgresql:// URLs or "key=value" strings.
+    """
+    if database_url.startswith("postgresql+psycopg://"):
+        return database_url
+    params = conninfo_to_dict(database_url)
+    url = URL.create(
+        "postgresql+psycopg",
+        username=params.pop("user", None),
+        password=params.pop("password", None),
+        host=params.pop("host", None),
+        port=int(params["port"]) if "port" in params else None,
+        database=params.pop("dbname", None),
+        query={k: str(v) for k, v in params.items() if k != "port"},
     )
-    cur = await conn.execute("SELECT name FROM schema_migrations")
-    done = {row[0] for row in await cur.fetchall()}
-    applied = []
-    for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
-        if path.name in done:
-            continue
-        async with conn.transaction():
-            await conn.execute(path.read_text())
-            await conn.execute("INSERT INTO schema_migrations (name) VALUES (%s)", (path.name,))
-        applied.append(path.name)
-    return applied
+    return url.render_as_string(hide_password=False)
 
 
-async def main() -> None:
-    async with await psycopg.AsyncConnection.connect(
-        Settings.from_env().database_url, autocommit=True
-    ) as conn:
-        applied = await migrate(conn)
-    print(f"applied: {applied}" if applied else "up to date")
+def alembic_config(database_url: str) -> Config:
+    """Alembic settings from alembic.ini, pointed at this database."""
+    config = Config(str(ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(ROOT / "migrations"))
+    # ConfigParser treats % as interpolation; escape it in case the password contains one.
+    config.set_main_option("sqlalchemy.url", sqlalchemy_url(database_url).replace("%", "%%"))
+    return config
+
+
+def upgrade_to_head(database_url: str) -> None:
+    """Apply every pending revision. Blocking: async callers use asyncio.to_thread."""
+    command.upgrade(alembic_config(database_url), "head")
+
+
+def head_revision() -> str:
+    """The newest revision id in migrations/versions/."""
+    return ScriptDirectory.from_config(alembic_config("postgresql://unused")).get_current_head()
+
+
+async def is_at_head(conn: psycopg.AsyncConnection) -> bool:
+    """True when the database has been migrated to the newest revision."""
+    cur = await conn.execute("SELECT to_regclass('alembic_version') IS NOT NULL")
+    if not (await cur.fetchone())[0]:
+        return False
+    cur = await conn.execute("SELECT version_num FROM alembic_version")
+    row = await cur.fetchone()
+    return row is not None and row[0] == head_revision()
+
+
+def main() -> None:
+    url = Settings.from_env().database_url
+    upgrade_to_head(url)
+    print(f"at {head_revision()}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -19,6 +19,7 @@ from app import store
 from app.config import Settings
 from app.db import make_pool
 from app.events import InvalidEvent, normalise_reg_no
+from app.migrate import is_at_head
 from app.store import CompanyRow, SimilarRow
 
 # A request waits at most this long for a database connection, then gets a 503.
@@ -166,10 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def readyz(request: Request):
         try:
             async with request.app.state.pool.connection() as conn:
-                cur = await conn.execute(
-                    "SELECT 1 FROM schema_migrations WHERE name = '001_init.sql'"
-                )
-                ready = await cur.fetchone() is not None
+                ready = await is_at_head(conn)
         except (psycopg.Error, PoolTimeout):
             ready = False
         if not ready:

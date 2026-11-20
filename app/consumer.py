@@ -18,7 +18,7 @@ from app.config import Settings
 from app.db import make_pool
 from app.embedding import Embedder, make_embedder
 from app.ingest import Outcome, handle_message
-from app.migrate import migrate
+from app.migrate import upgrade_to_head
 
 QUEUE: Final = "company-events"
 SUMMARY_EVERY: Final = 500
@@ -51,9 +51,7 @@ async def run(settings: Settings, stop: asyncio.Event, embedder: Embedder) -> No
     """Consume until `stop` is set, then finish in-flight messages and close."""
     pool = await make_pool(settings.database_url)
     try:
-        async with pool.connection() as conn:
-            await conn.set_autocommit(True)  # migrate() manages its own transactions
-            await migrate(conn)
+        await asyncio.to_thread(upgrade_to_head, settings.database_url)
 
         counts: Counter = Counter()
         in_flight = 0

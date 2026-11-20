@@ -224,6 +224,27 @@ async def test_database_down_starts_and_answers_503_quickly(monkeypatch):
             assert r.json() == {"error": "database_unavailable"}
 
 
+async def test_readyz_behind_head(client, pool):
+    async with pool.connection() as conn:
+        await conn.execute("UPDATE alembic_version SET version_num = '0001_init'")
+    try:
+        r = await client.get("/readyz")
+        assert r.status_code == 503
+        assert r.json() == {"status": "not_ready"}
+    finally:
+        async with pool.connection() as conn:
+            await conn.execute("UPDATE alembic_version SET version_num = '0002_embedding_inline'")
+
+
+async def test_readyz_unmigrated_database(fresh_db_url):
+    app = create_app(_settings(fresh_db_url))  # reachable, but no alembic_version table
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=ASGITransport(app), base_url="http://test") as c:
+            r = await c.get("/readyz")
+    assert r.status_code == 503
+    assert r.json() == {"status": "not_ready"}
+
+
 async def test_health_and_readyz(client):
     assert (await client.get("/healthz")).json() == {"status": "ok"}
     r = await client.get("/readyz")

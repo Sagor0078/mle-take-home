@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import psycopg
@@ -9,7 +10,7 @@ from psycopg.conninfo import make_conninfo
 from app.config import Settings
 from app.db import make_pool
 from app.embedding import FakeEmbedder
-from app.migrate import migrate
+from app.migrate import upgrade_to_head
 
 
 def _url_for(base_url: str, dbname: str) -> str:
@@ -26,14 +27,28 @@ async def database_url():
         await admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
     url = _url_for(base, name)
     try:
-        async with await psycopg.AsyncConnection.connect(url, autocommit=True) as conn:
-            await migrate(conn)
+        await asyncio.to_thread(upgrade_to_head, url)
         yield url
     finally:
         async with await psycopg.AsyncConnection.connect(admin_url, autocommit=True) as admin:
             await admin.execute(
                 sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
             )
+
+
+@pytest.fixture
+def fresh_db_url():
+    """An empty database for one test (the session database is already migrated)."""
+    base = Settings.from_env().database_url
+    admin_url = make_conninfo(base, dbname="postgres")
+    name = f"companies_mig_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(admin_url, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    try:
+        yield make_conninfo(base, dbname=name)
+    finally:
+        with psycopg.connect(admin_url, autocommit=True) as admin:
+            admin.execute(sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -44,11 +59,11 @@ async def pool(database_url):
 
 
 async def truncate_all(pool) -> None:
-    """Empty every table except schema_migrations."""
+    """Empty every table except alembic_version."""
     async with pool.connection() as conn:
         cur = await conn.execute(
             "SELECT tablename FROM pg_tables "
-            "WHERE schemaname = 'public' AND tablename <> 'schema_migrations'"
+            "WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
         )
         tables = [row[0] for row in await cur.fetchall()]
         if tables:

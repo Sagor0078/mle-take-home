@@ -27,7 +27,7 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 from app.config import Settings
-from app.migrate import migrate
+from app.migrate import upgrade_to_head
 from app.store import SIMILAR_SQL
 
 LIMIT = 4
@@ -54,8 +54,7 @@ HNSW_SQL = """
 
 async def apply_migrations(url: str) -> None:
     """The app's migrations, so the bench table has the app's schema and storage settings."""
-    async with await psycopg.AsyncConnection.connect(url, autocommit=True) as conn:
-        await migrate(conn)
+    await asyncio.to_thread(upgrade_to_head, url)
 
 
 def load_source(source_url: str) -> list[tuple]:

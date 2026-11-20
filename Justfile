@@ -21,7 +21,7 @@ publish:
 
 # Apply database migrations.
 migrate:
-    uv run python -m app.migrate
+    uv run alembic upgrade head
 
 # Run the queue consumer.
 consume:

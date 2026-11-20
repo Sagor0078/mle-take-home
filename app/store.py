@@ -51,8 +51,8 @@ def _field_assignment(field: str) -> sql.Composable:
     f_mid = sql.Identifier(f"{field}_message_id")
     wins = sql.SQL(
         "EXCLUDED.{f} IS NOT NULL AND (companies.{f} IS NULL OR"
-        " (COALESCE(EXCLUDED.{f_at}, '-infinity'), EXCLUDED.{f_mid})"
-        " > (COALESCE(companies.{f_at}, '-infinity'), COALESCE(companies.{f_mid}, '')))"
+        " (COALESCE(EXCLUDED.{f_at}, '-infinity'), EXCLUDED.{f_mid} COLLATE \"C\")"
+        " > (COALESCE(companies.{f_at}, '-infinity'), COALESCE(companies.{f_mid}, '') COLLATE \"C\"))"
     ).format(f=f, f_at=f_at, f_mid=f_mid)
     return sql.SQL(", ").join(
         sql.SQL("{col} = CASE WHEN {wins} THEN EXCLUDED.{col} ELSE companies.{col} END").format(
@@ -64,7 +64,8 @@ def _field_assignment(field: str) -> sql.Composable:
 
 # Per-field last-writer-wins: an incoming field replaces the stored one iff it has a value
 # and the stored one is empty or its (event_at, message_id) is smaller. Missing event_at
-# counts as -infinity, so an untimed event only fills empty fields.
+# counts as -infinity, so an untimed event only fills empty fields. message_ids compare
+# in byte order (COLLATE "C") so the tie-break does not depend on the server's locale.
 _COLUMNS = ["reg_no", "last_upsert_at"] + [
     f"{field}{suffix}" for field in FIELDS for suffix in ("", "_updated_at", "_message_id")
 ]
@@ -108,10 +109,11 @@ async def apply_event(conn: AsyncConnection, event: CompanyEvent, message_id: st
 async def refresh_embedding(conn: AsyncConnection, reg_no: str, embedder: Embedder) -> None:
     """Make the row's embedding match its current description (or industry fallback)."""
     cur = await conn.execute(
-        "SELECT nature, industry, embedding_text_hash, embedding_model FROM companies WHERE reg_no = %s",
+        "SELECT nature, industry, embedding_text_hash, embedding_model, embedding_source"
+        " FROM companies WHERE reg_no = %s",
         (reg_no,),
     )
-    nature, industry, stored_hash, stored_model = await cur.fetchone()
+    nature, industry, stored_hash, stored_model, stored_source = await cur.fetchone()
     chosen = embedding_text(nature, industry)
     if chosen is None:
         await conn.execute(
@@ -123,7 +125,7 @@ async def refresh_embedding(conn: AsyncConnection, reg_no: str, embedder: Embedd
     text, source = chosen
     digest = text_hash(text)
     model = embedder.model_name
-    if (digest, model) == (stored_hash, stored_model):
+    if (digest, model, source) == (stored_hash, stored_model, stored_source):
         return
 
     cur = await conn.execute(

@@ -186,3 +186,40 @@ async def test_concurrent_duplicate_applies_once(pool, embedder):
     outcomes = await asyncio.gather(*(handle_message(pool, embedder, body, "same") for _ in range(5)))
     assert sorted(outcomes) == ["applied"] + ["duplicate"] * 4
     assert await scalar(pool, "SELECT count(*) FROM company_events") == 1
+
+
+@pytest.mark.parametrize("order", [("industry", "nature"), ("nature", "industry")])
+async def test_embedding_source_order_independent(pool, embedder, order):
+    # The description cleans to the same text as the industry fallback ("Retail business").
+    bodies = {
+        "industry": msg(REG, at("09:00"), industry="Retail"),
+        "nature": msg(REG, at("10:00"), natureOfBusiness="Retail business"),
+    }
+    for mid in order:
+        await handle_message(pool, embedder, bodies[mid], mid)
+    assert await embedding_source(pool) == "nature"
+
+
+async def test_struck_off_without_timestamp(pool, embedder):
+    await handle_message(pool, embedder, struck(REG, None), "m1")
+    assert await scalar(pool, "SELECT struck_off_at = '-infinity' FROM companies WHERE reg_no = %s", REG)
+    assert (await company(pool)).active is False
+    await handle_message(pool, embedder, msg(REG, None, companyName="Acme"), "m2")
+    assert (await company(pool)).active is False
+    await handle_message(pool, embedder, msg(REG, at("09:00"), state="Johor"), "m3")
+    assert (await company(pool)).active is True
+
+
+async def test_upsert_without_fields_creates_row(pool, embedder):
+    body = json.dumps({"type": "company-upserted", "registrationNumber": REG, "data": None}).encode()
+    assert await handle_message(pool, embedder, body, "m1") == "applied"
+    assert await company(pool) is not None
+    assert await scalar(pool, "SELECT last_upsert_at FROM companies WHERE reg_no = %s", REG) is None
+
+
+@pytest.mark.parametrize("order", [("a", "B"), ("B", "a")])
+async def test_tie_break_uses_byte_order(pool, embedder, order):
+    # Byte order ("C" collation) puts "a" after "B"; a locale collation would not.
+    for mid in order:
+        await handle_message(pool, embedder, msg(REG, at("09:00"), companyName=f"from {mid}"), mid)
+    assert (await company(pool)).name == "from a"

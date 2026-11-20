@@ -1,6 +1,8 @@
 """Embedders: a real fastembed model for production, a hashed bag of words for tests."""
 
 import hashlib
+import os
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
@@ -40,6 +42,14 @@ class FakeEmbedder:
         return vec / np.linalg.norm(vec)
 
 
+def model_cache_dir() -> str:
+    """Where fastembed keeps downloaded models: $FASTEMBED_CACHE_PATH, else ~/.cache/fastembed.
+
+    fastembed's own default is under the system temp dir, which is wiped on reboot.
+    """
+    return os.environ.get("FASTEMBED_CACHE_PATH") or str(Path.home() / ".cache" / "fastembed")
+
+
 class FastEmbedder:
     """Wraps a fastembed model. The model loads (and may download) on construction."""
 
@@ -47,7 +57,7 @@ class FastEmbedder:
         from fastembed import TextEmbedding
 
         self.model_name = model_name
-        self._model = TextEmbedding(model_name=model_name)
+        self._model = TextEmbedding(model_name=model_name, cache_dir=model_cache_dir())
         dim = len(next(iter(self._model.embed(["dimension probe"]))))
         assert dim == DIMENSION, f"{model_name} has dimension {dim}, expected {DIMENSION}"
 

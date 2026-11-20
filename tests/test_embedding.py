@@ -1,6 +1,8 @@
+from pathlib import Path
+
 import numpy as np
 
-from app.embedding import FakeEmbedder, make_embedder, text_hash
+from app.embedding import FakeEmbedder, make_embedder, model_cache_dir, text_hash
 
 
 def test_fake_embedder_deterministic_and_normalised():
@@ -25,3 +27,13 @@ def test_text_hash_is_sha256_hex():
 
 def test_make_embedder_fake():
     assert make_embedder("fake-hashed-bow").model_name == "fake-hashed-bow"
+
+
+def test_model_cache_dir_is_persistent_by_default(monkeypatch):
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    assert model_cache_dir() == str(Path.home() / ".cache" / "fastembed")
+
+
+def test_model_cache_dir_overridable(monkeypatch):
+    monkeypatch.setenv("FASTEMBED_CACHE_PATH", "/somewhere/else")
+    assert model_cache_dir() == "/somewhere/else"

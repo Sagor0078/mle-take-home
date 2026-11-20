@@ -16,6 +16,7 @@ import pytest_asyncio
 
 from app.config import Settings
 from app.consumer import QUEUE, run
+from app.embedding import FakeEmbedder
 from producer.publish import publish
 from tests.feed_helpers import FEED_LINES, replay, snapshot
 from tests.conftest import truncate_all
@@ -129,7 +130,7 @@ async def _publish_and_consume(settings, pool, management_url) -> None:
     _, acked_before = await _queue_stats(management_url)
     await publish(FEED_LINES, settings.rabbitmq_url)
     stop = asyncio.Event()
-    task = asyncio.create_task(run(settings, stop))
+    task = asyncio.create_task(run(settings, stop, FakeEmbedder()))
     try:
         deadline = time.monotonic() + TIMEOUT_SECONDS
         while True:

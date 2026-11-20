@@ -16,7 +16,7 @@ from aio_pika.abc import AbstractIncomingMessage
 
 from app.config import Settings
 from app.db import make_pool
-from app.embedding import make_embedder
+from app.embedding import Embedder, make_embedder
 from app.ingest import Outcome, handle_message
 from app.migrate import migrate
 
@@ -47,15 +47,13 @@ def _summary(counts: Counter) -> str:
     return " ".join(f"{name}={counts[name]}" for name in ("applied", "duplicate", "rejected", "requeued"))
 
 
-async def run(settings: Settings, stop: asyncio.Event) -> None:
+async def run(settings: Settings, stop: asyncio.Event, embedder: Embedder) -> None:
     """Consume until `stop` is set, then finish in-flight messages and close."""
     pool = await make_pool(settings.database_url)
     try:
         async with pool.connection() as conn:
             await conn.set_autocommit(True)  # migrate() manages its own transactions
             await migrate(conn)
-        embedder = make_embedder(settings.embed_model)
-        embedder.embed(["warm up"])  # load the model before the first message arrives
 
         counts: Counter = Counter()
         in_flight = 0
@@ -99,12 +97,22 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # model download chatter
 
+    settings = Settings.from_env()
+    # Load the model (a download on first run) before the signal handlers below take over
+    # Ctrl-C, so Ctrl-C here interrupts at once instead of waiting for the download.
+    try:
+        embedder = make_embedder(settings.embed_model)
+        embedder.embed(["warm up"])
+    except KeyboardInterrupt:
+        log.info("interrupted while loading %s", settings.embed_model)
+        return
+
     async def _main() -> None:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
-        await run(Settings.from_env(), stop)
+        await run(settings, stop, embedder)
 
     asyncio.run(_main())
 

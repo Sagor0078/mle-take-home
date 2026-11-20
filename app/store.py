@@ -157,3 +157,30 @@ async def get_company(conn: AsyncConnection, reg_no: str) -> CompanyRow | None:
     )
     row = await cur.fetchone()
     return CompanyRow(*row) if row else None
+
+
+@dataclass(frozen=True)
+class SimilarRow:
+    reg_no: str
+    name: str | None
+    industry: str | None
+    state: str | None
+    score: float
+
+
+# Exact scan (cheap at this size). Ties on cosine distance are broken deterministically:
+# same industry first, then same state, then reg_no.
+SIMILAR_SQL = """
+    SELECT c.reg_no, c.name, c.industry, c.state, 1 - (c.embedding <=> q.embedding) AS score
+    FROM companies c, (SELECT embedding, industry, state FROM companies WHERE reg_no = %(reg)s) q
+    WHERE c.active AND c.embedding IS NOT NULL AND c.reg_no <> %(reg)s
+    ORDER BY c.embedding <=> q.embedding,
+             c.industry IS DISTINCT FROM q.industry, c.state IS DISTINCT FROM q.state, c.reg_no
+    LIMIT %(limit)s
+"""
+
+
+async def similar_companies(conn: AsyncConnection, reg_no: str, limit: int) -> list[SimilarRow]:
+    """The `limit` active companies closest in meaning to this one, best first."""
+    cur = await conn.execute(SIMILAR_SQL, {"reg": reg_no, "limit": limit})
+    return [SimilarRow(*row) for row in await cur.fetchall()]

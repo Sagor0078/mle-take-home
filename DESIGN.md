@@ -243,8 +243,8 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 140 tests in about a minute. Integration tests use the docker-compose Postgres (with pgvector) and a
-throwaway database per test session. No test downloads a model.
+`just test` runs 142 tests in about two minutes. Integration tests use the docker-compose Postgres (with pgvector) and a
+throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is unreachable. No test downloads a model.
 
 | File | What it shows |
 |---|---|
@@ -258,6 +258,7 @@ throwaway database per test session. No test downloads a model.
 | `tests/test_eval_metrics.py` | The evaluation metrics on hand-built vectors: perfect clusters give precision 1.0; known ranks give exact recall and MRR; identical texts and the query itself are skipped; ties count against the target. |
 | `tests/test_reembed.py` | `reembed` moves every embedding to a new model (a `FakeEmbedder` subclass with another `model_name`) and is a no-op with the same model. |
 | `tests/test_consumer.py` | `on_message`: valid → ack; poison → recorded and acked; no `message_id` → body hash; transient error → sleep, then nack with requeue, nothing recorded. |
+| `tests/test_consumer_rabbitmq.py` | Real broker: the feed published to `company-events` and drained by `run` gives the same `companies` table (every column) and rejection counts as a direct replay; publishing it again changes nothing. |
 
 The order-independence test is the one that matters most: it checks the property the design is built around, on the
 real feed, rather than the cases I thought of.

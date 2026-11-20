@@ -43,8 +43,7 @@ async def pool(database_url):
     await p.close()
 
 
-@pytest_asyncio.fixture
-async def clean_db(pool):
+async def truncate_all(pool) -> None:
     """Empty every table except schema_migrations."""
     async with pool.connection() as conn:
         cur = await conn.execute(
@@ -55,6 +54,12 @@ async def clean_db(pool):
         if tables:
             names = sql.SQL(", ").join(sql.Identifier(t) for t in tables)
             await conn.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY").format(names))
+
+
+@pytest_asyncio.fixture
+async def clean_db(pool):
+    """Start the test with empty tables."""
+    await truncate_all(pool)
 
 
 @pytest.fixture

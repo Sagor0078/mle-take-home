@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from app import store
+from app import api, store
 from app.api import create_app
 from app.config import Settings
 from app.ingest import handle_message
@@ -26,16 +26,18 @@ def strike(reg: str, at: str) -> bytes:
     ).encode()
 
 
+def _settings(database_url: str) -> Settings:
+    return Settings(
+        database_url=database_url,
+        rabbitmq_url="amqp://unused",
+        embed_model="fake-hashed-bow",
+        prefetch=1,
+    )
+
+
 @pytest_asyncio.fixture
 async def client(database_url):
-    app = create_app(
-        Settings(
-            database_url=database_url,
-            rabbitmq_url="amqp://unused",
-            embed_model="fake-hashed-bow",
-            prefetch=1,
-        )
-    )
+    app = create_app(_settings(database_url))
     # ASGITransport does not run the lifespan, so enter it here.
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=ASGITransport(app), base_url="http://test") as c:
@@ -168,6 +170,58 @@ async def test_db_down_returns_503(client, pool, embedder, monkeypatch):
     r = await client.get("/companies/SYN-000001/similar")
     assert r.status_code == 503
     assert r.json() == {"error": "database_unavailable"}
+
+
+async def test_unmigrated_database_returns_503_json(client, pool, embedder, monkeypatch):
+    await seed(pool, embedder, "SYN-000001", natureOfBusiness="coffee cafe")
+
+    async def no_table(*args, **kwargs):
+        raise psycopg.errors.UndefinedTable('relation "companies" does not exist')
+
+    monkeypatch.setattr(store, "similar_companies", no_table)
+    r = await client.get("/companies/SYN-000001/similar")
+    assert r.status_code == 503
+    assert r.json() == {"error": "database_unavailable"}
+
+
+async def test_unexpected_error_returns_500_json(database_url, pool, embedder, monkeypatch):
+    await seed(pool, embedder, "SYN-000001", natureOfBusiness="coffee cafe")
+
+    async def bug(*args, **kwargs):
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(store, "similar_companies", bug)
+    app = create_app(_settings(database_url))
+    # The server re-raises after sending the response (so it gets logged); don't fail the test on that.
+    transport = ASGITransport(app, raise_app_exceptions=False)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.get("/companies/SYN-000001/similar")
+    assert r.status_code == 500
+    assert r.json() == {"error": "internal_error"}
+
+
+async def test_unknown_route_returns_json_error(client):
+    r = await client.get("/no/such/route")
+    assert r.status_code == 404
+    assert r.json() == {"error": "not_found"}
+    r = await client.post("/healthz")
+    assert r.status_code == 405
+    assert r.json() == {"error": "method_not_allowed"}
+
+
+async def test_database_down_starts_and_answers_503_quickly(monkeypatch):
+    monkeypatch.setattr(api, "API_POOL_TIMEOUT_SECONDS", 0.5)
+    app = create_app(_settings("postgresql://postgres:postgres@127.0.0.1:1/nothing"))
+    async with app.router.lifespan_context(app):  # start-up must not wait for or fail on the database
+        async with httpx.AsyncClient(transport=ASGITransport(app), base_url="http://test") as c:
+            assert (await c.get("/healthz")).status_code == 200
+            r = await c.get("/readyz")
+            assert r.status_code == 503
+            assert r.json() == {"status": "not_ready"}
+            r = await c.get("/companies/SYN-000001/similar")
+            assert r.status_code == 503
+            assert r.json() == {"error": "database_unavailable"}
 
 
 async def test_health_and_readyz(client):

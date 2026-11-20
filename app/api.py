@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from typing import Annotated, Literal
 
 import psycopg
@@ -12,12 +13,16 @@ from psycopg import AsyncConnection
 from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import store
 from app.config import Settings
 from app.db import make_pool
 from app.events import InvalidEvent, normalise_reg_no
 from app.store import CompanyRow, SimilarRow
+
+# A request waits at most this long for a database connection, then gets a 503.
+API_POOL_TIMEOUT_SECONDS = 5.0
 
 
 class ApiModel(BaseModel):
@@ -93,7 +98,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.pool = await make_pool(settings.database_url)
+        # wait=False: start (and answer /healthz, /readyz) even while the database is down.
+        app.state.pool = await make_pool(
+            settings.database_url, timeout=API_POOL_TIMEOUT_SECONDS, wait=False
+        )
         try:
             yield
         finally:
@@ -110,10 +118,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         detail = [{k: v for k, v in e.items() if k in ("loc", "msg", "type")} for e in exc.errors()]
         return JSONResponse({"error": "invalid_request", "detail": detail}, status_code=422)
 
-    @app.exception_handler(psycopg.OperationalError)
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException):
+        # Unknown route (404), wrong method (405), ...: {"error": "not_found"} etc.
+        error = HTTPStatus(exc.status_code).phrase.lower().replace(" ", "_")
+        return JSONResponse({"error": error}, status_code=exc.status_code, headers=exc.headers)
+
+    # Any database error: down, pool timeout, or not migrated yet (UndefinedTable).
+    @app.exception_handler(psycopg.Error)
     @app.exception_handler(PoolTimeout)
     async def database_unavailable(request: Request, exc: Exception):
         return JSONResponse({"error": "database_unavailable"}, status_code=503)
+
+    @app.exception_handler(Exception)
+    async def internal_error(request: Request, exc: Exception):
+        # Starlette re-raises the exception after sending this response, so uvicorn logs the traceback.
+        return JSONResponse({"error": "internal_error"}, status_code=500)
 
     @app.get("/companies/{reg_no}", response_model=CompanyCard)
     async def company_card(company: KnownCompany):

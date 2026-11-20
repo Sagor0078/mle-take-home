@@ -96,7 +96,7 @@ models on first use. Method and results are in [`DESIGN.md` section 6](DESIGN.md
 
 ```bash
 just up         # Postgres is required; without RabbitMQ the end-to-end tests skip
-just test       # 142 tests, about two minutes
+just test       # 142 tests, about two to three minutes
 ```
 
 The tests create a throwaway database `companies_test_<hex>` on the same Postgres server and drop it at the end, so

@@ -243,7 +243,7 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 142 tests in about two minutes. Integration tests use the docker-compose Postgres (with pgvector) and a
+`just test` runs 142 tests in about two to three minutes. Integration tests use the docker-compose Postgres (with pgvector) and a
 throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is unreachable. No test downloads a model.
 
 | File | What it shows |
@@ -264,8 +264,8 @@ The order-independence test is the one that matters most: it checks the property
 real feed, rather than the cases I thought of.
 
 The full path through RabbitMQ (`just consume` + `just publish` twice, Ctrl-C) was run by hand with the real model:
-`applied=2433 duplicate=68 rejected=17`, then all 2,518 duplicates, then a clean shutdown. There is no automated test
-for `run()` against a real broker yet (section 8).
+`applied=2433 duplicate=68 rejected=17`, then all 2,518 duplicates, then a clean shutdown. `tests/test_consumer_rabbitmq.py`
+now automates this against the dev broker with the fake embedder.
 
 ## 6. Recommendation quality
 
@@ -375,8 +375,8 @@ Being honest about what is not done or not proven:
   Malay↔English pairs labelled by the author, which the candidate should review. No user signal.
 - **No latency measurement.** A single request for SYN-001550 took about 30 ms through curl on a laptop, but there is
   no p50/p95 benchmark, and no HNSW vs exact-scan comparison. The spec target is p95 < 50 ms.
-- **No automated end-to-end test through RabbitMQ.** `on_message` is tested with a fake message; `run()` (connection,
-  prefetch, shutdown) was verified by hand only.
+- **The RabbitMQ end-to-end test uses the fake embedder and the shared dev queue.** It purges `company-events`, so it
+  must not run against a broker holding real traffic; real-model runs were verified by hand only.
 - **Shutdown race window.** `run()` counts a message as in flight when its handler starts. A delivery handed over
   between cancelling the subscription and that first line could be cut off at shutdown. The broker redelivers it
   (it was never acked) and the dedupe makes that safe, so the cost is one redelivery, not data loss.

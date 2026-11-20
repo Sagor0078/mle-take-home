@@ -221,12 +221,29 @@ HOSTILE_BODIES = [
     event(data=["a", "b"]),
     b"\xff\xfe\x00",
     b"",
+    # Valid JSON that Postgres cannot store: NUL in text or jsonb, lone surrogates, NaN/Infinity in jsonb.
+    event(data={"companyName": "Foo\u0000Bar"}),
+    b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": {"natureOfBusiness": "a\x00b"}}',
+    event(**{"extra\u0000key": 1}),
+    event(data={"companyName": "\ud800"}),
+    b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": {"employees": NaN}}',
+    b'{"type": "company-struck-off", "registrationNumber": "SYN-000001", "extra": Infinity}',
 ]
 
 
 @pytest.mark.parametrize("body", HOSTILE_BODIES)
 def test_parse_event_only_raises_invalid_event(body):
-    try:
+    with pytest.raises(InvalidEvent):
         parse_event(body)
-    except InvalidEvent:
-        pass
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        event(data={"companyName": "Foo\u0000Bar"}),
+        event(data={"companyName": "\ud800"}),
+        b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": {"employees": NaN}}',
+    ],
+)
+def test_unstorable_payload_rejected(body):
+    assert reason_of(body) == "unstorable"

@@ -20,6 +20,7 @@ REASONS = (
     "invalid_registration_number",
     "invalid_updated_at",
     "invalid_data",
+    "unstorable",
 )
 
 CANONICAL_STATES = (
@@ -146,4 +147,20 @@ def parse_event(body: bytes) -> CompanyEvent:
         fields = _parse_fields(payload.get("data"))
     else:
         fields = CompanyFields()
+    if not _is_storable(payload):
+        raise InvalidEvent("unstorable")
     return CompanyEvent(event_type, reg_no, event_at, fields, payload)
+
+
+def _is_storable(payload: dict) -> bool:
+    """Can Postgres store this as jsonb and text? Rules out NaN/Infinity, lone surrogates and NUL.
+
+    Such bodies are valid JSON to Python but fail the same way on every retry at the database.
+    """
+    try:
+        dumped = json.dumps(payload, allow_nan=False, ensure_ascii=False)
+        dumped.encode("utf-8")
+    except (ValueError, UnicodeEncodeError):
+        return False
+    # json.dumps writes a NUL character as the six characters \u0000, which jsonb rejects.
+    return "\\u0000" not in dumped

@@ -2,8 +2,10 @@ import asyncio
 import json
 
 import numpy as np
+import psycopg
 import pytest
 
+from app import store
 from app.ingest import handle_message
 from app.store import get_company
 
@@ -70,6 +72,31 @@ async def test_missing_message_id_falls_back_to_body_hash(pool, embedder):
 async def test_invalid_message_recorded_and_acked(pool, embedder):
     assert await handle_message(pool, embedder, b"null", "bad") == "rejected"
     assert await scalar(pool, "SELECT reason FROM rejected_messages WHERE message_id = 'bad'") == "not_an_object"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": {"companyName": "a\\u0000b"}}',
+        b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": {"employees": NaN}}',
+    ],
+)
+async def test_unstorable_message_rejected(pool, embedder, body):
+    assert await handle_message(pool, embedder, body, "bad") == "rejected"
+    assert await scalar(pool, "SELECT reason FROM rejected_messages WHERE message_id = 'bad'") == "unstorable"
+    assert await scalar(pool, "SELECT count(*) FROM companies") == 0
+
+
+async def test_data_error_on_write_is_rejected_not_retried(pool, embedder, monkeypatch):
+    # Safety net for anything parse_event's checks miss: a DataError will fail the same way on every retry.
+    async def bad_data(*args, **kwargs):
+        raise psycopg.DataError("invalid byte sequence")
+
+    monkeypatch.setattr(store, "apply_event", bad_data)
+    body = msg(REG, at("09:00"), companyName="Acme")
+    assert await handle_message(pool, embedder, body, "m1") == "rejected"
+    assert await scalar(pool, "SELECT reason FROM rejected_messages WHERE message_id = 'm1'") == "unstorable"
+    assert await handle_message(pool, embedder, body, "m1") == "duplicate"
 
 
 async def test_rejected_duplicate_is_duplicate(pool, embedder):

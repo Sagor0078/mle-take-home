@@ -181,16 +181,23 @@ companies with `httpx.AsyncClient` at concurrency 10; `just scale-bench` times t
   over ~2 kB has its 1.5 kB vector in the TOAST table, and the query vector was fetched again for every candidate:
   `EXPLAIN ANALYZE` showed 23,836 buffer hits and 34.7 ms for 2,000 rows, and HTTP p95 was 164 ms.
   `migrations/002_embedding_inline.sql` sets the column to `STORAGE MAIN` (vector kept in the row) and rewrites
-  existing rows. Now: **691 buffer hits, 6–7 ms** (seq scan of 1,987 rows + top-N heapsort).
-- **HTTP after the fix, three runs: p50 35–50 ms, p95 61–74 ms, p99 77–96 ms** (195–261 req/s). This misses the
-  50 ms p95 target, but not because of the query: the same SQL at concurrency 10 over psycopg has p95 7 ms, and the
-  card endpoint `/companies/{reg}` (one primary-key lookup, no vectors) has p95 80–100 ms in the same harness. The
-  time goes to one Python process serving 10 concurrent requests and to the client (httpx used a full core); a
-  minimal asyncio client measured p95 48–75 ms. An index cannot fix that; more server processes can (section 8).
-- **Decision: keep the exact scan.** Exact search plus re-sort is the only way to keep the tie-break order. HNSW with
+  existing rows. Now: **691 buffer hits, 6–7 ms** (seq scan of 1,987 rows + top-N heapsort). The row is now over
+  ~2 kB, so Postgres moves the short text columns (`*_message_id`, `embedding_text_hash`) to TOAST instead (5,288
+  chunks of 64 B in the dev database): harmless for `/similar`, which does not read them, and a small cost on the
+  merge path, which does.
+- **HTTP after the fix: p95 47–101 ms over nine runs** (p50 28–41 ms, p99 60–181 ms, 211–311 req/s), with
+  `uvicorn[standard]` (uvloop + httptools). Without it, nine runs gave p95 59–74 ms and 195–262 req/s: it raised
+  throughput and p50 and put p95 under 50 ms in 2 of 9 runs, but its tail is wider, so no clear p95 win. A pool of 10 connections instead of
+  psycopg_pool's 4 lowered p50 (25–28 ms) but made p95 worse (64–104 ms), so the pool stays at 4. **The 50 ms p95
+  target is met only in some runs.** The query is not the main cost: the same SQL at concurrency 10 over psycopg has
+  p95 7 ms, and the card endpoint (one primary-key lookup, no vectors, same pool) had p95 80–100 ms in the same
+  harness. Where the rest goes is probably server and client CPU on a busy laptop (the httpx client used a full
+  core), but I did not isolate it. Untested: several uvicorn workers (a quick 4-worker try was worse; section 8),
+  and a client on another machine.
+- **Decision: keep the exact scan.** It orders in SQL, ties included, so the tie-break order always holds. HNSW with
   `hnsw.iterative_scan = relaxed_order`, a 4x over-fetch and a Python re-sort on the same keys returns equally close
   neighbours (the top-4 scores matched on 100% of queries at 2k), but only 63% of the same companies: a group of
-  identical descriptions larger than the over-fetch (16) is cut at random, so the panel would differ from the exact
+  identical descriptions larger than the over-fetch (16) is cut arbitrarily (changes when the index is rebuilt), so the panel would differ from the exact
   one. At 2k it saves ~4 ms of a ~50 ms request.
 
 | companies | exact p50 / p95 | HNSW + re-sort p50 / p95 | HNSW build | recall@4 (same companies / same scores) |
@@ -203,7 +210,8 @@ Sizes above 2k are the real rows plus jittered copies (Gaussian noise σ = 0.01 
 reg. nos), 200 random query companies each, in a throwaway database. HNSW uses `vector_cosine_ops` with default
 `m`/`ef_construction`, default `maintenance_work_mem` (64 MB) and no parallel build (docker's 64 MB `/dev/shm` is
 too small), which is why the 200k build took 7 minutes. The exact scan's SQL p95 crosses 50 ms at about 20k rows
-(p50 23–29 ms, p95 28–68 ms over three runs at 20k).
+(p50 23–29 ms, p95 28–68 ms over three runs at 20k). "Same scores" is the share of queries whose four
+distances all equal the exact top 4 (all or nothing per query).
 
 ### 2.9 API errors are JSON with an `error` key
 
@@ -384,8 +392,9 @@ change. These are the changes in the order I would make them as volume grows.
    `ORDER BY embedding <=> q LIMIT limit*4` inside a transaction with `SET LOCAL hnsw.iterative_scan =
    relaxed_order` (so the `active` filter cannot return fewer than `limit` rows), then re-sort the candidates in
    Python by (distance, other industry, other state, reg. no.). Scores matched the exact top 4 on 95–96% of
-   queries; ties larger than the over-fetch make the chosen companies differ (section 2.8), so either accept that
-   or over-fetch more.
+   queries; a tie group larger than the over-fetch makes the chosen companies differ (section 2.8). Over-fetching
+   more only shrinks that: the exact tie order is guaranteed only while every tie group fits in the over-fetch, so
+   accept it, or fetch the whole tie group at the boundary distance with a second, exact query.
 2. **Move embedding out of the transaction (approach C).** Today the model runs while the transaction holds the row
    lock on that company. That is fine at this size and thanks to the cache, but with many new descriptions it slows
    every writer. Instead: the consumer marks the row `embedding_stale` (an outbox), commits and acks; a separate
@@ -411,10 +420,11 @@ Being honest about what is not done or not proven:
 
 - **Recommendation quality is measured only offline, on proxies** (section 6): industry agreement and 30
   Malay↔English pairs labelled by the author, which the candidate should review. No user signal.
-- **HTTP p95 at concurrency 10 is 61–74 ms on the laptop, above the 50 ms target** (section 2.8). The query is
-  6–7 ms; the rest is one uvicorn process and the benchmark client sharing a busy laptop. Next step: run several
-  workers (`uvicorn --workers N`) and benchmark from another machine. A quick 4-worker try was slower (~50 ms even
-  at concurrency 1, which looks like a TCP delayed-ACK stall); I did not diagnose it.
+- **HTTP p95 at concurrency 10 is 47–101 ms on the laptop, so the 50 ms target is met only in some runs** (section
+  2.8). The query is 6–7 ms; the rest is probably server and client CPU on a busy laptop, not isolated. Tried:
+  uvloop + httptools (kept: more throughput, no clear p95 change) and a 10-connection pool (worse tail, reverted).
+  Untested: a client on another machine, and several uvicorn workers; a quick 4-worker try was slower (~50 ms even at concurrency 1,
+  which looks like a TCP delayed-ACK stall) and I did not diagnose it.
 - **The RabbitMQ end-to-end test uses the fake embedder and the shared dev queue.** It purges `company-events`, so it
   must not run against a broker holding real traffic; real-model runs were verified by hand only.
 - **Shutdown race window.** `run()` counts a message as in flight when its handler starts. A delivery handed over

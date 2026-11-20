@@ -132,7 +132,8 @@ def recall(exact: dict[str, list], approx: dict[str, list]) -> tuple[float, floa
     found = same_scores = 0
     for reg, top in exact.items():
         found += len({r for r, _ in top} & {r for r, _ in approx[reg]})
-        same_scores += np.allclose([d for _, d in top], [d for _, d in approx[reg]], atol=1e-6)
+        exact_d, approx_d = [d for _, d in top], [d for _, d in approx[reg]]
+        same_scores += len(exact_d) == len(approx_d) and np.allclose(exact_d, approx_d, atol=1e-6)
     return found / (LIMIT * len(exact)), same_scores / len(exact)
 
 

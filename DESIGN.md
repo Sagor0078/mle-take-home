@@ -157,9 +157,9 @@ ORDER BY c.embedding <=> q.embedding,
 LIMIT %(limit)s
 ```
 
-- **Exact, no HNSW index (yet).** At 2,000 rows a sequential scan is cheap, and it is exact, which matters because of
-  the next point. An HNSW index with a `WHERE active` filter can also return fewer than `limit` rows (the filter is
-  applied after the index scan). Whether and when to add HNSW is a measurement that is not done yet (section 8).
+- **Exact, no HNSW index (measured; see "Latency" below).** At 2,000 rows the scan takes ~6 ms, and it is exact,
+  which matters because of the next point. An HNSW index orders by distance only, and with a `WHERE active` filter
+  it can return fewer than `limit` rows (the filter is applied after the index scan).
 - **Deterministic ties.** 178 distinct texts across 2,000 companies means many identical scores. Ties go to the same
   industry, then the same state, then `reg_no`, so the panel never shuffles between page loads.
 - **Score** is cosine similarity (1 = identical text).
@@ -170,6 +170,40 @@ SYN-000344, a coffee shop in Kuantan (0.862). The first three are the mock's thr
 is a Logistics company; with `bge-small-en-v1.5` we reproduced that (an exact tie at 0.830 between SYN-000700 and the
 mock's SYN-000831, broken by "same state first"), and the multilingual model replaces it with another café
 (section 6).
+
+#### Latency
+
+Measured on a laptop (Intel i7-1355U, 10 cores / 12 threads, Postgres 16 + pgvector 0.8.7 in docker, one uvicorn
+worker, browser and IDE running: expect ±30% run to run). `just bench` makes 1,000 requests for random active
+companies with `httpx.AsyncClient` at concurrency 10; `just scale-bench` times the SQL alone (table below).
+
+- **The first run found a storage problem, not a scan problem.** pgvector stores vectors as `EXTERNAL`, so a row
+  over ~2 kB has its 1.5 kB vector in the TOAST table, and the query vector was fetched again for every candidate:
+  `EXPLAIN ANALYZE` showed 23,836 buffer hits and 34.7 ms for 2,000 rows, and HTTP p95 was 164 ms.
+  `migrations/002_embedding_inline.sql` sets the column to `STORAGE MAIN` (vector kept in the row) and rewrites
+  existing rows. Now: **691 buffer hits, 6–7 ms** (seq scan of 1,987 rows + top-N heapsort).
+- **HTTP after the fix, three runs: p50 35–50 ms, p95 61–74 ms, p99 77–96 ms** (195–261 req/s). This misses the
+  50 ms p95 target, but not because of the query: the same SQL at concurrency 10 over psycopg has p95 7 ms, and the
+  card endpoint `/companies/{reg}` (one primary-key lookup, no vectors) has p95 80–100 ms in the same harness. The
+  time goes to one Python process serving 10 concurrent requests and to the client (httpx used a full core); a
+  minimal asyncio client measured p95 48–75 ms. An index cannot fix that; more server processes can (section 8).
+- **Decision: keep the exact scan.** Exact search plus re-sort is the only way to keep the tie-break order. HNSW with
+  `hnsw.iterative_scan = relaxed_order`, a 4x over-fetch and a Python re-sort on the same keys returns equally close
+  neighbours (the top-4 scores matched on 100% of queries at 2k), but only 63% of the same companies: a group of
+  identical descriptions larger than the over-fetch (16) is cut at random, so the panel would differ from the exact
+  one. At 2k it saves ~4 ms of a ~50 ms request.
+
+| companies | exact p50 / p95 | HNSW + re-sort p50 / p95 | HNSW build | recall@4 (same companies / same scores) |
+|---|---|---|---|---|
+| 2,000 (real) | 6.0 / 9.5 ms | 1.8 / 4.1 ms | 0.2 s | 0.63 / 1.00 |
+| 20,000 | 24.8 / 68.0 ms | 3.3 / 4.8 ms | 4.4 s | 0.61 / 0.95 |
+| 200,000 | 263 / 456 ms | 8.9 / 15.4 ms | 430 s | 0.65 / 0.96 |
+
+Sizes above 2k are the real rows plus jittered copies (Gaussian noise σ = 0.01 per dimension, re-normalised; new
+reg. nos), 200 random query companies each, in a throwaway database. HNSW uses `vector_cosine_ops` with default
+`m`/`ef_construction`, default `maintenance_work_mem` (64 MB) and no parallel build (docker's 64 MB `/dev/shm` is
+too small), which is why the 200k build took 7 minutes. The exact scan's SQL p95 crosses 50 ms at about 20k rows
+(p50 23–29 ms, p95 28–68 ms over three runs at 20k).
 
 ### 2.9 API errors are JSON with an `error` key
 
@@ -243,7 +277,7 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 142 tests in about two to three minutes. Integration tests use the docker-compose Postgres (with pgvector) and a
+`just test` runs 143 tests in about two to three minutes. Integration tests use the docker-compose Postgres (with pgvector) and a
 throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is unreachable. No test downloads a model.
 
 | File | What it shows |
@@ -251,7 +285,7 @@ throwaway database per test session; the RabbitMQ end-to-end tests skip when the
 | `tests/test_events.py` | One test per feed trap in section 3: reg. no. forms, every timestamp form, truncated JSON, invalid UTF-8, raw control characters, non-object bodies, unknown/missing type, string `data`, "Unknown" names, blank fields, state mapping, extra keys. Hostile bodies (huge digit strings, deep nesting) raise only `InvalidEvent`. |
 | `tests/test_text.py` | Repeated-phrase collapse (and no collapse of a partial repeat); description vs fallback vs nothing. |
 | `tests/test_embedding.py` | The fake embedder is deterministic, normalised and finite on empty text; `text_hash`. |
-| `tests/test_migrate.py` | Migrations are idempotent; tables exist. |
+| `tests/test_migrate.py` | Migrations are idempotent; tables exist; embeddings use `STORAGE MAIN` (kept in the row). |
 | `tests/test_store.py` | The merge rules one scenario at a time: older event does not overwrite; older *full* event after a newer partial fills the missing fields; untimed events only fill empty fields; ties broken by `message_id` in byte order (both arrival orders); strike-off hides; stale upsert does not resurrect; newer upsert revives; strike-off before any upsert; fallback embedding, its replacement, and none at all; the embedding follows the final description; the cache is shared; two concurrent copies of one message apply once; `embedding_source` is the same in both arrival orders. |
 | `tests/test_feed_replay.py` | The whole feed through `handle_message`, with up to a pool's worth of messages in flight like the consumer: exact counts and rejection reasons; **order independence**: three random shuffles, each plus 500 redelivered messages, produce a `companies` table identical to the in-order run in every column, including the embedding vectors; replaying the feed twice gives 2,518 duplicates and no change. |
 | `tests/test_api.py` | Most similar first; self excluded; struck-off companies excluded; `limit` honoured and validated; deterministic order on ties; `syn-…` normalised; 404, 422; card for an active and a struck-off company; empty list with `no_description`; 503 when the database is down; `/healthz` and `/readyz`. |
@@ -343,11 +377,15 @@ result in section 2.8 with `"model": "sentence-transformers/paraphrase-multiling
 10x is about 20,000 companies and 25,000 events per replay; the current design handles that without structural
 change. These are the changes in the order I would make them as volume grows.
 
-1. **Measure, then add HNSW.** The exact scan is linear in the number of active companies. Once it exceeds the latency
-   budget, add `CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)` and use pgvector 0.8's
-   `SET LOCAL hnsw.iterative_scan = relaxed_order` with an over-fetch and re-sort, so the `active` filter cannot
-   return fewer than `limit` rows. The exact ordering keys (industry, state, reg. no.) are then applied to the
-   candidates, and HNSW recall should be checked against the exact scan.
+1. **Add HNSW at about 10x.** The exact scan is linear in active companies: measured SQL p95 9.5 ms at 2k, 68 ms
+   at 20k, 456 ms at 200k (section 2.8). At 10x it is at the 50 ms budget, so that is when to switch. The recipe,
+   measured at 20k/200k (p95 4.8/15.4 ms): `CREATE INDEX ... USING hnsw (embedding vector_cosine_ops)` (build with
+   more `maintenance_work_mem` and a larger `shm_size` for parallel workers: 430 s at 200k without), query
+   `ORDER BY embedding <=> q LIMIT limit*4` inside a transaction with `SET LOCAL hnsw.iterative_scan =
+   relaxed_order` (so the `active` filter cannot return fewer than `limit` rows), then re-sort the candidates in
+   Python by (distance, other industry, other state, reg. no.). Scores matched the exact top 4 on 95–96% of
+   queries; ties larger than the over-fetch make the chosen companies differ (section 2.8), so either accept that
+   or over-fetch more.
 2. **Move embedding out of the transaction (approach C).** Today the model runs while the transaction holds the row
    lock on that company. That is fine at this size and thanks to the cache, but with many new descriptions it slows
    every writer. Instead: the consumer marks the row `embedding_stale` (an outbox), commits and acks; a separate
@@ -373,8 +411,10 @@ Being honest about what is not done or not proven:
 
 - **Recommendation quality is measured only offline, on proxies** (section 6): industry agreement and 30
   Malay↔English pairs labelled by the author, which the candidate should review. No user signal.
-- **No latency measurement.** A single request for SYN-001550 took about 30 ms through curl on a laptop, but there is
-  no p50/p95 benchmark, and no HNSW vs exact-scan comparison. The spec target is p95 < 50 ms.
+- **HTTP p95 at concurrency 10 is 61–74 ms on the laptop, above the 50 ms target** (section 2.8). The query is
+  6–7 ms; the rest is one uvicorn process and the benchmark client sharing a busy laptop. Next step: run several
+  workers (`uvicorn --workers N`) and benchmark from another machine. A quick 4-worker try was slower (~50 ms even
+  at concurrency 1, which looks like a TCP delayed-ACK stall); I did not diagnose it.
 - **The RabbitMQ end-to-end test uses the fake embedder and the shared dev queue.** It purges `company-events`, so it
   must not run against a broker holding real traffic; real-model runs were verified by hand only.
 - **Shutdown race window.** `run()` counts a message as in flight when its handler starts. A delivery handed over

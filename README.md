@@ -92,11 +92,18 @@ just reembed    # after changing EMBED_MODEL: re-embeds every company with it (s
 `just eval` reads the `companies` database (read only), so run it after consuming the feed. It downloads both real
 models on first use. Method and results are in [`DESIGN.md` section 6](DESIGN.md#6-recommendation-quality).
 
+```bash
+just bench        # p50/p95/p99 of /similar at concurrency 10 against `just serve` (same API_PORT), plus EXPLAIN ANALYZE
+just scale-bench  # exact scan vs HNSW at 2k/20k/200k companies in a throwaway database, dropped afterwards
+```
+
+Results are in [`DESIGN.md` section 2.8](DESIGN.md#28-similarity-search-exact-scan).
+
 ### Tests
 
 ```bash
 just up         # Postgres is required; without RabbitMQ the end-to-end tests skip
-just test       # 142 tests, about two to three minutes
+just test       # 143 tests, about two to three minutes
 ```
 
 The tests create a throwaway database `companies_test_<hex>` on the same Postgres server and drop it at the end, so
@@ -130,8 +137,9 @@ printf 'POSTGRES_PORT=5435\nRABBITMQ_PORT=5673\nRABBITMQ_UI_PORT=15673\n' > .env
 ```
 app/          config, db (pool), migrate, events (parse/normalise), text (description cleaning),
               embedding, store (all SQL), ingest (one message = one transaction), consumer, api, reembed
-eval/         model evaluation: metrics.py (pure functions), evaluate.py (`just eval`), pairs.csv (labelled pairs)
-migrations/   001_init.sql
+eval/         model evaluation: metrics.py (pure functions), evaluate.py (`just eval`), pairs.csv (labelled pairs);
+              bench.py (`just bench`), scale_bench.py (`just scale-bench`)
+migrations/   001_init.sql, 002_embedding_inline.sql
 tests/        unit tests for parsing/text/embedding; integration tests against Postgres
 DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use
 ```

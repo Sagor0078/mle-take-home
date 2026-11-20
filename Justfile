@@ -42,3 +42,11 @@ eval:
 # Re-embed every company with the configured model (run after changing EMBED_MODEL).
 reembed:
     uv run python -m app.reembed
+
+# Latency of /companies/{reg_no}/similar against a running `just serve` (same API_PORT).
+bench:
+    uv run python -m eval.bench --url http://127.0.0.1:${API_PORT:-8000}
+
+# Exact scan vs HNSW at 2k/20k/200k companies, in a throwaway database (a few minutes).
+scale-bench:
+    uv run python -m eval.scale_bench

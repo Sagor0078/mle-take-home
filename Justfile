@@ -38,3 +38,7 @@ test:
 # Run the recommendation-quality evaluation.
 eval:
     uv run python -m eval.evaluate
+
+# Re-embed every company with the configured model (run after changing EMBED_MODEL).
+reembed:
+    uv run python -m app.reembed

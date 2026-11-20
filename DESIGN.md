@@ -34,6 +34,8 @@ portal ─► FastAPI  GET /companies/{reg}/similar ─► one SQL query: cosine
 | `app/consumer.py` | aio-pika loop: prefetch, ack after commit, back-off and requeue on transient errors, graceful shutdown. |
 | `app/api.py` | FastAPI app: cards, similar companies, health and readiness, JSON errors. |
 | `app/migrate.py` | Applies `migrations/*.sql` once each, tracked in `schema_migrations`. |
+| `app/reembed.py` | `just reembed`: re-embeds every company with the configured model after a model change. |
+| `eval/` | `just eval`: the model comparison in section 6 (`metrics.py` pure functions, `evaluate.py`, `pairs.csv`). |
 
 No ORM: the SQL is in `app/store.py` and `migrations/001_init.sql`, so what runs against the database is visible.
 
@@ -138,10 +140,10 @@ the fields: whatever order events arrive in, the final description is the same, 
 - **Cache:** `embedding_cache (model, sha256(text)) → vector`. The feed has only 178 distinct descriptions for 2,000
   companies, so the model runs a couple of hundred times for the whole feed, not 2,433. Keying on the model means a
   model change never mixes vectors from two models.
-- **Model:** `BAAI/bge-small-en-v1.5` through fastembed (CPU, 384 dimensions, ~67 MB), configurable with
-  `EMBED_MODEL`. Vectors are L2-normalised; distance is cosine (`<=>`). The model call runs in a worker thread
-  (`asyncio.to_thread`) so it does not block the event loop. Whether this is the right model for a feed with many
-  Malay descriptions is the subject of section 6.
+- **Model:** `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` through fastembed (CPU, 384 dimensions,
+  ~220 MB), configurable with `EMBED_MODEL`. It replaced the brief's `BAAI/bge-small-en-v1.5` after the comparison in
+  section 6. Vectors are L2-normalised; distance is cosine (`<=>`). The model call runs in a worker thread
+  (`asyncio.to_thread`) so it does not block the event loop.
 - **Tests** use `FakeEmbedder`, a deterministic hashed bag of words, so they never download a model.
 
 ### 2.8 Similarity search: exact scan
@@ -162,10 +164,12 @@ LIMIT %(limit)s
   industry, then the same state, then `reg_no`, so the panel never shuffles between page loads.
 - **Score** is cosine similarity (1 = identical text).
 
-For the README's mock company SYN-001550, the top four are SYN-000539 (identical description, score 1.0), SYN-000263
-and SYN-001650 (0.834 each), and a Logistics company at 0.830. The first three are the mock's three food companies.
-For the fourth slot there is an exact tie at 0.830 between SYN-000700 (Logistics, Selangor) and SYN-000831 (Logistics,
-Kuala Lumpur, the one in the mock); our "same state first" rule picks SYN-000700 because SYN-001550 is in Selangor.
+For the README's mock company SYN-001550 ("Operating cafes and coffee shops in the Klang Valley"), the top four are
+SYN-000539 (identical description, score 1.0), SYN-000263 and SYN-001650 (the Malay translation, 0.950 each), and
+SYN-000344, a coffee shop in Kuantan (0.862). The first three are the mock's three food companies. The mock's fourth
+is a Logistics company; with `bge-small-en-v1.5` we reproduced that (an exact tie at 0.830 between SYN-000700 and the
+mock's SYN-000831, broken by "same state first"), and the multilingual model replaces it with another café
+(section 6).
 
 ### 2.9 API errors are JSON with an `error` key
 
@@ -202,7 +206,7 @@ that was made.
 | `natureOfBusiness` null or empty | 58 | Absent. |
 | Description repeating one phrase many times | several | Collapsed to one copy before embedding (stored text unchanged). |
 | Distinct descriptions | 178 for 2,000 companies | Embedding cache; many exact score ties, broken deterministically. |
-| Descriptions in Malay | roughly 600 events | Embedded as they are with an English model; evaluated in section 6. |
+| Descriptions in Malay | roughly 600 events (73 of 180 distinct texts) | Embedded with a multilingual model, chosen by the comparison in section 6. |
 | Companies whose only description is missing | 35 | Industry fallback embedding (section 2.7). |
 | Companies with no description and no industry | 4 | No embedding; page renders, `"reason": "no_description"`. |
 
@@ -239,7 +243,7 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 127 tests in about a minute. Integration tests use the docker-compose Postgres (with pgvector) and a
+`just test` runs 140 tests in about a minute. Integration tests use the docker-compose Postgres (with pgvector) and a
 throwaway database per test session. No test downloads a model.
 
 | File | What it shows |
@@ -251,6 +255,8 @@ throwaway database per test session. No test downloads a model.
 | `tests/test_store.py` | The merge rules one scenario at a time: older event does not overwrite; older *full* event after a newer partial fills the missing fields; untimed events only fill empty fields; ties broken by `message_id` in byte order (both arrival orders); strike-off hides; stale upsert does not resurrect; newer upsert revives; strike-off before any upsert; fallback embedding, its replacement, and none at all; the embedding follows the final description; the cache is shared; two concurrent copies of one message apply once; `embedding_source` is the same in both arrival orders. |
 | `tests/test_feed_replay.py` | The whole feed through `handle_message`, with up to a pool's worth of messages in flight like the consumer: exact counts and rejection reasons; **order independence**: three random shuffles, each plus 500 redelivered messages, produce a `companies` table identical to the in-order run in every column, including the embedding vectors; replaying the feed twice gives 2,518 duplicates and no change. |
 | `tests/test_api.py` | Most similar first; self excluded; struck-off companies excluded; `limit` honoured and validated; deterministic order on ties; `syn-…` normalised; 404, 422; card for an active and a struck-off company; empty list with `no_description`; 503 when the database is down; `/healthz` and `/readyz`. |
+| `tests/test_eval_metrics.py` | The evaluation metrics on hand-built vectors: perfect clusters give precision 1.0; known ranks give exact recall and MRR; identical texts and the query itself are skipped; ties count against the target. |
+| `tests/test_reembed.py` | `reembed` moves every embedding to a new model (a `FakeEmbedder` subclass with another `model_name`) and is a no-op with the same model. |
 | `tests/test_consumer.py` | `on_message`: valid → ack; poison → recorded and acked; no `message_id` → body hash; transient error → sleep, then nack with requeue, nothing recorded. |
 
 The order-independence test is the one that matters most: it checks the property the design is built around, on the
@@ -262,8 +268,74 @@ for `run()` against a real broker yet (section 8).
 
 ## 6. Recommendation quality
 
-The model evaluation (bge-small-en vs a multilingual model, on industry agreement and Malay↔English pairs) follows in
-this section.
+**Question.** 73 of the 180 distinct texts are Malay. Does the brief's English model, `BAAI/bge-small-en-v1.5`, put a
+Malay company next to English companies in the same business, or only next to other Malay text? `just eval`
+(`eval/evaluate.py`, metrics in `eval/metrics.py`) compares it with `paraphrase-multilingual-MiniLM-L12-v2` (also
+384 dimensions, both through fastembed) and the hashed bag of words as a floor.
+
+**Method.** The 1,988 active companies that have something to embed, using exactly the text the service embeds
+(`embedding_text`). Each distinct text is embedded once per model; similarity is cosine.
+
+- **Industry P@4.** For each company with an industry, the share of its 4 nearest neighbours in the same industry; a
+  neighbour without an industry counts as a miss. Industry is a proxy: it says "same sector", not "good
+  recommendation". Reported twice. *All neighbours* is what the panel shows, but most descriptions are shared by 20–40
+  companies, so the top 4 are mostly exact copies, which always share an industry in this data: it measures the
+  duplicates, not the model. *Other texts* skips neighbours whose text is identical to the company's, so it asks
+  whether the nearest *different* description is in the same sector. I kept every company (rather than collapsing to
+  180 texts) so a description weighs as often as it is shown; each text maps to one industry here, so collapsing
+  would only reweight. "Random neighbours" is the chance level.
+- **Malay↔English pairs** (`eval/pairs.csv`, 30 pairs: 24 without a town, 6 with one). For each Malay text, the rank
+  of its English counterpart among all 180 distinct texts (the query itself excluded), and the reverse. Recall@1,
+  recall@5, MRR. A tie with the counterpart counts against it.
+- **Speed:** best of three, embedding the 180 texts on this laptop's CPU, model load excluded.
+
+| Model | Industry P@4 (all) | Industry P@4 (other texts) | ms→en R@1 | ms→en R@5 | ms→en MRR | en→ms R@1 | en→ms R@5 | en→ms MRR | ms / 100 texts |
+|---|---|---|---|---|---|---|---|---|---|
+| random neighbours | 0.086 | 0.076 | | | | | | | |
+| fake-hashed-bow | 0.939 | 0.314 | 0.03 | 0.03 | 0.061 | 0.03 | 0.07 | 0.062 | 2 |
+| bge-small-en-v1.5 | 0.925 | 0.496 | 0.03 | 0.07 | 0.071 | 0.17 | 0.23 | 0.221 | 716–962 |
+| paraphrase-multilingual-MiniLM-L12-v2 | **0.941** | **0.821** | **0.83** | **0.97** | **0.886** | **0.83** | **0.97** | **0.884** | 493–526 |
+
+(Speed is the range over two runs. The full output, including every pair's rank, is printed by `just eval`.)
+
+**What the numbers say.**
+
+- **bge-small-en does not cross languages.** A Malay description finds its English counterpart first in 1 of 30
+  cases (median rank 84 of 179), barely better than the bag of words. A one-off check (Malay detected by the
+  descriptions' leading word; not part of `just eval`) shows why: 97% of the 4 nearest neighbours of a Malay text are
+  other Malay texts, whatever the business. For the multilingual model it is 60%.
+- **The multilingual model does.** 25 of 30 counterparts rank first and 29 of 30 in the top 5, in both directions.
+  The misses are the town pairs (it ranks "parcel delivery in another town" above the exact town, worst case 12th)
+  and one loose translation ("Kedai runcit barangan keperluan harian" vs "Mini market selling groceries...").
+  For recommendations, the same business in another town is an acceptable neighbour.
+- **Sector agreement** beyond exact copies rises from 0.50 to 0.82 (chance 0.08). Partly the same effect: the
+  nearest different text to a Malay description is often its translation. P@4 over all neighbours is 0.93–0.94 for
+  every model, including the bag of words, which confirms it measures duplicates.
+- **SYN-001550:** both models give the same first three (the exact copy, then two Malay translations at 0.834 with
+  bge, 0.950 multilingual). bge's fourth is a Logistics parcel-delivery company that shares only "the Klang Valley"
+  (as in the mock); the multilingual model's is a café in Kuantan.
+- **Cost:** both embed in under 10 ms per text, and thanks to the cache only ~180 texts are ever embedded, so speed
+  does not decide. The multilingual model is ~220 MB on disk instead of ~67 MB, and truncates at 128 tokens; the
+  longest cleaned description is 11 words.
+
+**Limitations.**
+
+- **The pairs were picked and labelled by the author of this code (Claude, during implementation), not by a Malay
+  speaker. The candidate should review `eval/pairs.csv`.** 30 pairs is small, and choosing descriptions with a clear
+  translation favours a translation-trained model. With n = 30 a recall of 0.83 has a 95% interval of roughly
+  0.66–0.93; the gap to 0.03 is far outside that, but a difference of a few pairs would not be.
+- Industry is a weak label (a pharmacy and a home-nursing service are both Healthcare and may not be "similar").
+- The feed is synthetic and templated (178 descriptions, town variants). Free-text descriptions from a real registry
+  could rank the models differently; the eval should be rerun on a real sample before trusting the margin.
+- Only these two models were compared; `multilingual-e5-small` would be the next candidate. Both come as fastembed's
+  quantised ONNX builds, so the numbers are for those builds. Tie order in P@4 is by registration number, not the
+  API's same-industry-first rule; with distinct texts real models almost never tie.
+
+**Decision.** The default is now `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (`Settings`, README).
+It wins every quality metric, decisively on the Malay↔English one that motivated the comparison, at no practical
+speed cost. `just reembed` (`app/reembed.py`) re-embedded the dev database in 15 s (it calls `refresh_embedding`, which
+already recomputes rows whose `embedding_model` differs), and `GET /companies/SYN-001550/similar` now returns the
+result in section 2.8 with `"model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"`.
 
 ## 7. At 10x (and beyond)
 
@@ -289,16 +361,17 @@ change. These are the changes in the order I would make them as volume grows.
    from a replica.
 6. **Housekeeping.** `processed_messages` grows forever; keep it for a window longer than any plausible redelivery
    (or keep only hashes). Partition `company_events` by month.
-7. **Model swaps without downtime.** The cache is keyed by model and each row records `embedding_model`, so a backfill
-   can re-embed into the new model and switch the API's model when complete. The API would need to filter on the
-   model during the switch.
+7. **Model swaps without downtime.** The cache is keyed by model and each row records `embedding_model`.
+   `just reembed` exists but works in place: while it runs (15 s for 2,000 companies) the table holds two models'
+   vectors and similarity across them is meaningless. At scale, write the new vectors to a second column, backfill,
+   then switch the API's query; or filter on `embedding_model` during the switch.
 
 ## 8. What's left
 
 Being honest about what is not done or not proven:
 
-- **Recommendation quality is not evaluated yet** (section 6). The default model is the brief's suggestion, not a
-  measured choice, and roughly 600 of the 2,433 applied events carry a Malay description.
+- **Recommendation quality is measured only offline, on proxies** (section 6): industry agreement and 30
+  Malay↔English pairs labelled by the author, which the candidate should review. No user signal.
 - **No latency measurement.** A single request for SYN-001550 took about 30 ms through curl on a laptop, but there is
   no p50/p95 benchmark, and no HNSW vs exact-scan comparison. The spec target is p95 < 50 ms.
 - **No automated end-to-end test through RabbitMQ.** `on_message` is tested with a fake message; `run()` (connection,

@@ -12,8 +12,9 @@ returns similar companies. Why it is built this way, what was assumed, how it is
 - A **final** Python 3.14 release. Older uv versions install 3.14.0rc2, on which pydantic (and so FastAPI) fails to
   import. If `uv run python --version` prints an `rc`, run `uv self update && uv python install 3.14`, then
   `rm -rf .venv && just setup`. Tested with uv 0.13.9 and Python 3.14.10.
-- About 70 MB of free disk and network access the first time the consumer starts: it downloads the embedding model
-  `BAAI/bge-small-en-v1.5` (~67 MB) through fastembed.
+- About 250 MB of free disk and network access the first time the consumer starts: it downloads the embedding model
+  `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (~220 MB) through fastembed. It was chosen over
+  `BAAI/bge-small-en-v1.5` by a measured comparison ([`DESIGN.md` section 6](DESIGN.md#6-recommendation-quality)).
 
 ### Run it
 
@@ -56,14 +57,14 @@ Response from a database filled by the steps above (scores shortened here to 3 d
     {"registrationNumber": "SYN-000539", "name": "Seri Sejahtera Food Sdn. Bhd.",
      "industry": "Food & Beverage", "state": "Johor", "status": "active", "score": 1.0},
     {"registrationNumber": "SYN-000263", "name": "Gemilang Delima Food Sdn. Bhd.",
-     "industry": "Food & Beverage", "state": "Johor", "status": "active", "score": 0.834},
+     "industry": "Food & Beverage", "state": "Johor", "status": "active", "score": 0.950},
     {"registrationNumber": "SYN-001650", "name": "Everbright Pacific Food Sdn. Bhd.",
-     "industry": "Food & Beverage", "state": "Kuala Lumpur", "status": "active", "score": 0.834},
-    {"registrationNumber": "SYN-000700", "name": "Teguh Mega Logistik Trading",
-     "industry": "Logistics", "state": "Selangor", "status": "active", "score": 0.830}
+     "industry": "Food & Beverage", "state": "Kuala Lumpur", "status": "active", "score": 0.950},
+    {"registrationNumber": "SYN-000344", "name": "Harmoni Maju Kopi Sdn. Bhd.",
+     "industry": "Food & Beverage", "state": "Kedah", "status": "active", "score": 0.862}
   ],
   "reason": null,
-  "model": "BAAI/bge-small-en-v1.5"
+  "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 }
 ```
 
@@ -81,11 +82,21 @@ Other endpoints and cases:
 
 Interactive docs are at http://localhost:8000/docs.
 
+### Model evaluation and switching models
+
+```bash
+just eval       # compares the hashed bag of words, bge-small-en and the multilingual model on the companies table
+just reembed    # after changing EMBED_MODEL: re-embeds every company with it (safe to run twice)
+```
+
+`just eval` reads the `companies` database (read only), so run it after consuming the feed. It downloads both real
+models on first use. Method and results are in [`DESIGN.md` section 6](DESIGN.md#6-recommendation-quality).
+
 ### Tests
 
 ```bash
 just up         # the tests need the Postgres container (not RabbitMQ)
-just test       # 127 tests, about a minute
+just test       # 140 tests, about a minute
 ```
 
 The tests create a throwaway database `companies_test_<hex>` on the same Postgres server and drop it at the end, so
@@ -104,7 +115,7 @@ Everything has a default that matches `docker-compose.yml`. Set variables in you
 | `RABBITMQ_UI_PORT` | `15672` | compose (management UI) |
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:$POSTGRES_PORT/companies` | consumer, API, migrate, tests |
 | `RABBITMQ_URL` | `amqp://guest:guest@localhost:$RABBITMQ_PORT/` | consumer, producer |
-| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | consumer (any 384-dim fastembed model); API reports it as `model` |
+| `EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | consumer, `just reembed` (any 384-dim fastembed model); API reports it as `model` |
 | `PREFETCH` | `32` | consumer: unacked messages in flight |
 | `API_PORT` | `8000` | `just serve` |
 
@@ -118,7 +129,8 @@ printf 'POSTGRES_PORT=5435\nRABBITMQ_PORT=5673\nRABBITMQ_UI_PORT=15673\n' > .env
 
 ```
 app/          config, db (pool), migrate, events (parse/normalise), text (description cleaning),
-              embedding, store (all SQL), ingest (one message = one transaction), consumer, api
+              embedding, store (all SQL), ingest (one message = one transaction), consumer, api, reembed
+eval/         model evaluation: metrics.py (pure functions), evaluate.py (`just eval`), pairs.csv (labelled pairs)
 migrations/   001_init.sql
 tests/        unit tests for parsing/text/embedding; integration tests against Postgres
 DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use

@@ -21,6 +21,8 @@ class Settings:
                 "DATABASE_URL", f"postgresql://postgres:postgres@localhost:{pg_port}/companies"
             ),
             rabbitmq_url=os.environ.get("RABBITMQ_URL", f"amqp://guest:guest@localhost:{mq_port}/"),
-            embed_model=os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+            embed_model=os.environ.get(
+                "EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            ),
             prefetch=int(os.environ.get("PREFETCH", "32")),
         )

@@ -33,12 +33,13 @@ portal ─► FastAPI  GET /companies/{reg}/similar ─► one SQL query: cosine
 | `app/ingest.py` | `handle_message`: one message → one transaction → `applied` / `duplicate` / `rejected`. |
 | `app/consumer.py` | aio-pika loop: prefetch, ack after commit, back-off and requeue on transient errors, graceful shutdown. |
 | `app/api.py` | FastAPI app: cards, similar companies, health and readiness, JSON errors. |
-| `app/migrate.py` | Applies `migrations/*.sql` once each, tracked in `schema_migrations`. |
+| `app/migrate.py` | Thin Alembic wrapper: `upgrade_to_head` (consumer, tests, bench), `is_at_head` (`/readyz`). |
+| `migrations/` | Alembic `env.py` and hand-written revisions `0001_init`, `0002_embedding_inline` (section 2.10). |
 | `app/reembed.py` | `just reembed`: re-embeds every company with the configured model after a model change. |
 | `eval/` | `just eval`: the model comparison in section 6 (`metrics.py` pure functions, `evaluate.py`, `pairs.csv`); `just bench` (`bench.py`) and `just scale-bench` (`scale_bench.py`): the latency numbers in section 2.8. |
 
-No ORM: the SQL is in `app/store.py` and `migrations/` (`001_init.sql`, `002_embedding_inline.sql`), so what runs
-against the database is visible.
+No ORM: the SQL is in `app/store.py` and the Alembic revisions in `migrations/versions/`, so what runs against the
+database is visible.
 
 ## 2. Decisions
 
@@ -194,7 +195,7 @@ companies with `httpx.AsyncClient` at concurrency 10; `just scale-bench` times t
 - **The first run found a storage problem, not a scan problem.** pgvector stores vectors as `EXTERNAL`, so a row
   over ~2 kB has its 1.5 kB vector in the TOAST table, and the query vector was fetched again for every candidate:
   `EXPLAIN ANALYZE` showed 23,836 buffer hits and 34.7 ms for 2,000 rows, and HTTP p95 was 164 ms.
-  `migrations/002_embedding_inline.sql` sets the column to `STORAGE MAIN` (vector kept in the row) and rewrites
+  Alembic revision `0002_embedding_inline` sets the column to `STORAGE MAIN` (vector kept in the row) and rewrites
   existing rows. Now: **691 buffer hits, 6–7 ms** (seq scan of 1,987 rows + top-N heapsort). The row is now over
   ~2 kB, so Postgres moves the short text columns (`*_message_id`, `embedding_text_hash`) to TOAST instead (5,288
   chunks of 64 B in the dev database): harmless for `/similar`, which does not read them, and a small cost on the
@@ -242,6 +243,25 @@ for it to connect, so `just serve` starts even while Postgres is down and `/read
 back. The consumer and `just reembed` keep the 30 s default and wait for the database at start-up: they cannot do
 anything without it, and a slow connection under load should not turn into a requeue.
 
+### 2.10 Migrations: Alembic with plain-SQL revisions
+
+Schema changes are Alembic revisions (`migrations/versions/0001_init.py`, `0002_embedding_inline.py`), each with a
+downgrade. They are written by hand as plain SQL through `op.execute`: there are no SQLAlchemy models, because the app
+has no ORM, so autogenerate is deliberately not used and the schema stays readable SQL. SQLAlchemy is only the
+connection Alembic needs while migrating; the app itself keeps async psycopg.
+
+- **One path for everyone.** The consumer (at start-up, in a thread), `just migrate` (`alembic upgrade head`), the test
+  fixtures and the scale bench all go through `app.migrate.upgrade_to_head`.
+- **Two migrators at once.** `env.py` holds a Postgres advisory lock for the whole run, so the consumer and
+  `just migrate` started together take turns instead of both creating the same tables. A test starts two migrating
+  processes against an empty database; it fails without the lock.
+- **Readiness.** `/readyz` is 200 only when `alembic_version` matches the newest revision, so an API started against a
+  database that is behind reports `not_ready`.
+- **Logging.** Alembic's `fileConfig` would disable loggers configured before it runs (the consumer's); `env.py` passes
+  `disable_existing_loggers=False`, and a test checks it.
+- **Downgrades** drop what a revision created. `0001_init`'s downgrade leaves the `vector` extension installed, since
+  other objects in the database may use it.
+
 ## 3. Assumptions
 
 Counts are from `data/feed.jsonl` (2,518 lines, 2,450 distinct messages). Where the brief was silent, this is the call
@@ -287,7 +307,7 @@ out of a real run through RabbitMQ with the real model.
 | `GET /companies/{reg_no}/similar?limit=4` | 200 `{company, similar[], reason, model}` | `limit` 1–20, default 4 (the mock shows 4). `similar` is most similar first. |
 | `GET /companies/{reg_no}` | 200 card | Every stored company, including struck-off ones. |
 | `GET /healthz` | 200 `{"status": "ok"}` | Process is up. |
-| `GET /readyz` | 200 `{"status": "ready"}` | Database reachable and `001_init.sql` applied; otherwise 503 `{"status": "not_ready"}`. |
+| `GET /readyz` | 200 `{"status": "ready"}` | Database reachable and at the latest Alembic revision; otherwise 503 `{"status": "not_ready"}`. |
 
 A card is `{registrationNumber, name, industry, state, status}` with `status` `"active"` or `"struck_off"`; cards in
 `similar` add `score`. JSON is camelCase, like the feed.
@@ -309,7 +329,7 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 161 tests in about two to three minutes. Integration tests use the docker-compose Postgres (with
+`just test` runs 171 tests in about four minutes. Integration tests use the docker-compose Postgres (with
 pgvector) and a throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is
 unreachable or another consumer (a running `just consume`) is attached to `company-events`. No test downloads a
 model.
@@ -319,10 +339,10 @@ model.
 | `tests/test_events.py` | One test per feed trap in section 3: reg. no. forms, every timestamp form, truncated JSON, invalid UTF-8, raw control characters, non-object bodies, unknown/missing type, string `data`, "Unknown" names, blank fields, state mapping, extra keys. Hostile bodies (huge digit strings, deep nesting, NUL, lone surrogates, NaN) all raise `InvalidEvent`; unstorable ones with reason `unstorable`. |
 | `tests/test_text.py` | Repeated-phrase collapse (and no collapse of a partial repeat); description vs fallback vs nothing. |
 | `tests/test_embedding.py` | The fake embedder is deterministic, normalised and finite on empty text; `text_hash`; the model cache directory (`~/.cache/fastembed`, or `FASTEMBED_CACHE_PATH`). |
-| `tests/test_migrate.py` | Migrations are idempotent; tables exist; embeddings use `STORAGE MAIN` (kept in the row). |
+| `tests/test_migrate.py` | Upgrade creates the full schema (generated `active`, `STORAGE MAIN`); upgrade is idempotent; downgrade to base and back; two migrating processes at once both succeed (fails without the advisory lock); Alembic does not silence the app's loggers; URL forms (`postgres://`, `postgresql://`, `key=value`). |
 | `tests/test_store.py` | The merge rules one scenario at a time: older event does not overwrite; older *full* event after a newer partial fills the missing fields; untimed events only fill empty fields; ties broken by `message_id` in byte order (both arrival orders); strike-off hides; stale upsert does not resurrect; newer upsert revives; strike-off before any upsert; fallback embedding, its replacement, and none at all; the embedding follows the final description; the cache is shared; two concurrent copies of one message apply once; `embedding_source` is the same in both arrival orders; NUL and NaN bodies are rejected as `unstorable`, and so is a message whose write raises `psycopg.DataError`. |
 | `tests/test_feed_replay.py` | The whole feed through `handle_message`, with up to a pool's worth of messages in flight like the consumer: exact counts and rejection reasons; **order independence**: three random shuffles, each plus 500 redelivered messages, produce a `companies` table identical to the in-order run in every column, including the embedding vectors; replaying the feed twice gives 2,518 duplicates and no change. |
-| `tests/test_api.py` | Most similar first; self excluded; struck-off companies excluded; `limit` honoured and validated; deterministic order on ties; `syn-…` normalised; 404, 422; card for an active and a struck-off company; empty list with `no_description`; 503 when the database is down or not migrated; 500 JSON for an unexpected error; JSON 404/405 for unknown routes; with Postgres unreachable the app still starts, `/readyz` is 503 and requests get a 503 within the pool timeout; `/healthz` and `/readyz`. |
+| `tests/test_api.py` | Most similar first; self excluded; struck-off companies excluded; `limit` honoured and validated; deterministic order on ties; `syn-…` normalised; 404, 422; card for an active and a struck-off company; empty list with `no_description`; 503 when the database is down or not migrated; 500 JSON for an unexpected error; JSON 404/405 for unknown routes; with Postgres unreachable the app still starts, `/readyz` is 503 and requests get a 503 within the pool timeout; `/readyz` is 503 on an unmigrated database or one behind the latest revision; `/healthz` and `/readyz`. |
 | `tests/test_eval_metrics.py` | The evaluation metrics on hand-built vectors: perfect clusters give precision 1.0; known ranks give exact recall and MRR; identical texts and the query itself are skipped; ties count against the target. |
 | `tests/test_reembed.py` | `reembed` moves every embedding to a new model (a `FakeEmbedder` subclass with another `model_name`) and is a no-op with the same model. |
 | `tests/test_consumer.py` | `on_message`: valid → ack; poison → recorded and acked; no `message_id` → body hash; transient error → sleep, then nack with requeue, nothing recorded. |
@@ -473,6 +493,8 @@ Being honest about what is not done or not proven:
 - **No metrics.** Counts are in logs only; a production version wants applied/duplicate/rejected/requeued counters,
   queue depth, and the age of the newest applied event.
 - **`just serve` does not migrate.** It relies on the consumer or `just migrate` having run; `/readyz` reports it.
+- **No migration for adopting a pre-Alembic database.** Databases created by the old runner need
+  `alembic stamp head` once; graders start from an empty database, so this was done by hand on the dev database.
 
 ## 9. AI tools used
 

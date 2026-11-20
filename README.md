@@ -23,13 +23,13 @@ returns similar companies. Why it is built this way, what was assumed, how it is
 ```bash
 just setup      # uv sync --locked: installs all dependencies
 just up         # Postgres (pgvector) + RabbitMQ, waits until healthy
-just migrate    # optional: the consumer also applies migrations when it starts
+just migrate    # optional (alembic upgrade head): the consumer also migrates when it starts
 just consume    # terminal 1: runs until Ctrl-C
 just publish    # terminal 2: puts the 2,518-message feed on the queue
 just serve      # terminal 3: API on http://localhost:8000 (API_PORT to change)
 ```
 
-`just consume` applies the migrations, loads the model, declares `company-events` exactly as the registry team does
+`just consume` applies the Alembic migrations, loads the model, declares `company-events` exactly as the registry team does
 (durable, no arguments) and processes messages until you press Ctrl-C. It logs a running total every 500 messages, and
 on Ctrl-C it waits for in-flight messages and prints the totals. For one publish of the feed that is:
 
@@ -41,7 +41,10 @@ Running `just publish` again is safe: every message is then a `duplicate` and th
 Rejected messages are kept, with the reason, in the `rejected_messages` table.
 
 `just serve` does **not** apply migrations. Start the consumer (or run `just migrate`) at least once before it;
-`GET /readyz` returns 503 until the schema exists.
+`GET /readyz` returns 503 until the database is at the latest Alembic revision.
+
+Migrations are Alembic revisions written as plain SQL (`migrations/versions/`). `uv run alembic current` shows the
+database's revision; `uv run alembic downgrade -1` steps back one revision.
 
 ### Try it
 
@@ -80,7 +83,7 @@ Other endpoints and cases:
 | `GET /companies/SYN-000048/similar` | 200 | no description and no industry: `"similar": []`, `"reason": "no_description"` |
 | `GET /companies/SYN-999999/similar` | 404 | `{"error": "company_not_found"}` |
 | `GET /companies/hello/similar` | 422 | `{"error": "invalid_registration_number"}` |
-| `GET /healthz`, `GET /readyz` | 200 / 503 | process up; database reachable and migrated |
+| `GET /healthz`, `GET /readyz` | 200 / 503 | process up; database reachable and at the latest Alembic revision |
 | any `/companies/...` with Postgres down or not migrated | 503 | `{"error": "database_unavailable"}` within 5 s |
 | `GET /no/such/route` | 404 | `{"error": "not_found"}` |
 
@@ -107,7 +110,7 @@ Results are in [`DESIGN.md` section 2.8](DESIGN.md#28-similarity-search-exact-sc
 
 ```bash
 just up         # Postgres is required; without RabbitMQ the end-to-end tests skip
-just test       # 161 tests, about two to three minutes
+just test       # 171 tests, about four minutes
 ```
 
 Stop `just consume` before `just test`: the end-to-end tests publish to and purge `company-events` (they skip if
@@ -143,11 +146,12 @@ printf 'POSTGRES_PORT=5435\nRABBITMQ_PORT=5673\nRABBITMQ_UI_PORT=15673\n' > .env
 ### Layout
 
 ```
-app/          config, db (pool), migrate, events (parse/normalise), text (description cleaning),
+app/          config, db (pool), migrate (Alembic wrapper), events (parse/normalise), text (description cleaning),
               embedding, store (all SQL), ingest (one message = one transaction), consumer, api, reembed
 eval/         model evaluation: metrics.py (pure functions), evaluate.py (`just eval`), pairs.csv (labelled pairs);
               bench.py (`just bench`), scale_bench.py (`just scale-bench`)
-migrations/   001_init.sql, 002_embedding_inline.sql
+alembic.ini   Alembic settings (the database URL comes from DATABASE_URL)
+migrations/   Alembic env.py; versions/0001_init.py, 0002_embedding_inline.py (plain SQL)
 tests/        unit tests for parsing/text/embedding; integration tests against Postgres
 DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use
 ```

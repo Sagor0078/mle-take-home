@@ -1,0 +1,89 @@
+// System design of the similar-companies service.
+// Render: dot -Tpng -Gdpi=150 docs/system-design.dot -o docs/system-design.png
+digraph system {
+  graph [rankdir=TB, fontname="Helvetica", fontsize=14, nodesep=0.45, ranksep=0.6, pad=0.35, newrank=true,
+         label=<<b>Similar companies: system design</b><br/><font point-size="11">at-least-once feed → idempotent, order-independent store → nearest-neighbour API</font><br/> >,
+         labelloc=t];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#5b6b7a", penwidth=1.2, margin="0.18,0.08"];
+  edge  [fontname="Helvetica", fontsize=10, color="#5b6b7a", penwidth=1.2];
+
+  // ------------------------------------------------------------------ row 1: registry (external)
+  subgraph cluster_registry {
+    label=<<b>Registry team</b> (external)>; style="rounded,dashed"; color="#9aa5b1"; fontsize=12;
+    producer [label=<<b>Registry feed</b><br/><font point-size="10">producer/publish.py · 2,518 msgs, 2,000 companies<br/>duplicates, out of order, malformed</font>>];
+    queue [shape=cylinder, fillcolor="#fff4e0", color="#d08a2a",
+           label=<<b>RabbitMQ</b> · queue <i>company-events</i><br/><font point-size="10">durable, no arguments · at-least-once · AMQP message_id</font>>];
+    producer -> queue [label=" publish"];
+  }
+
+  // ------------------------------------------------------------------ row 2: consumer
+  subgraph cluster_consumer {
+    label=<<b>Consumer</b>  <font point-size="10">just consume · app/consumer.py · prefetch 32</font>>;
+    style="rounded,filled"; fillcolor="#eef5ff"; color="#7aa7e0"; fontsize=12;
+
+    startup [fillcolor="#f7fbff", label=<<b>Start-up</b><br/><font point-size="10">Alembic upgrade head<br/>(advisory lock)<br/>load embedding model</font>>];
+
+    subgraph cluster_txn {
+      label=<<b>One message = one transaction</b>  <font point-size="10">app/ingest.py</font>>; style="rounded,filled"; fillcolor="#f7fbff"; color="#7aa7e0"; fontsize=11;
+      claim [label=<<b>1. Claim message_id</b><br/><font point-size="10">INSERT … ON CONFLICT<br/>DO NOTHING<br/>seen → <i>duplicate</i></font>>];
+      parse [label=<<b>2. Parse &amp; normalise</b><br/><font point-size="10">app/events.py (pure)<br/>reg no, 5 time formats, states<br/>bad body → <i>rejected</i> + reason</font>>];
+      lww   [label=<<b>3. Per-field last-writer-wins</b><br/><font point-size="10">app/store.py · one upsert<br/>field wins if (updatedAt, message_id)<br/>is newer · strike-off = tombstone</font>>];
+      embed [label=<<b>4. Refresh embedding</b><br/><font point-size="10">from the stored row:<br/>description, else industry<br/>cache by (model, text hash)</font>>];
+      ack [fillcolor="#e6f6ea", color="#5aa36b",
+           label=<<b>5. Commit, then ack</b><br/><font point-size="10">transient error:<br/>wait 1 s, nack + requeue</font>>];
+      claim -> parse -> lww -> embed -> ack;
+    }
+  }
+
+  model [shape=component, fillcolor="#f3eefc", color="#9b7ad1",
+         label=<<b>Embedding model</b> (CPU, fastembed)<br/><font point-size="10">paraphrase-multilingual-MiniLM-L12-v2<br/>384-d · Malay + English · chosen by <i>just eval</i></font>>];
+
+  // ------------------------------------------------------------------ row 3: database
+  subgraph cluster_db {
+    label=<<b>Postgres + pgvector</b>  <font point-size="10">schema: Alembic revisions in migrations/versions</font>>;
+    style="rounded,filled"; fillcolor="#f2f8f2"; color="#6aa56f"; fontsize=12;
+    companies [shape=cylinder, label=<<b>companies</b><br/><font point-size="10">each field + updated_at + message_id<br/>active (generated) · struck_off_at<br/>embedding vector(384), STORAGE MAIN</font>>];
+    side [shape=cylinder, label=<<b>bookkeeping</b><br/><font point-size="10">processed_messages · company_events<br/>rejected_messages · embedding_cache<br/>alembic_version</font>>];
+  }
+
+  // ------------------------------------------------------------------ row 4: API
+  subgraph cluster_api {
+    label=<<b>Similar-companies API</b>  <font point-size="10">just serve · app/api.py (FastAPI)</font>>;
+    style="rounded,filled"; fillcolor="#fff8ee"; color="#d9a35b"; fontsize=12;
+    similar [label=<<b>GET /companies/{reg}/similar?limit=4</b><br/><font point-size="10">exact cosine scan (&lt;=&gt;), active only, self excluded<br/>ties: same industry, same state, reg no</font>>];
+    card    [label=<<b>GET /companies/{reg}</b><br/><font point-size="10">the card; struck-off shown<br/>with its status</font>>];
+    health  [label=<<b>/healthz · /readyz</b><br/><font point-size="10">ready = DB up and at Alembic head<br/>JSON errors · 5 s pool timeout → 503</font>>];
+  }
+
+  tools [shape=note, fillcolor="#fafafa", color="#9aa5b1",
+         label=<<b>Offline tooling</b><br/><font point-size="10"><b>just eval</b> model comparison · <b>just bench / scale-bench</b> latency, exact vs HNSW<br/><b>just reembed</b> after a model change · <b>just migrate</b> alembic upgrade head</font>>];
+
+  // ------------------------------------------------------------------ row 5: portal
+  portal [fillcolor="#ffffff", color="#d9a35b",
+          label=<<b>OneCredit portal</b><br/><font point-size="10">company page with the "Similar companies" panel</font>>];
+
+  // ------------------------------------------------------------------ layout rows
+  { rank=same; startup; claim; parse; lww; embed; ack; }
+  { rank=same; companies; side; model; }
+  { rank=same; similar; card; health; }
+  { rank=same; portal; tools; }
+
+  // ------------------------------------------------------------------ flows
+  queue -> claim   [label=" deliver", color="#d08a2a", fontcolor="#a0661a", tailport=sw];
+  ack   -> queue   [xlabel="ack / nack ", style=dashed, color="#d08a2a", fontcolor="#a0661a", constraint=false, headport=se];
+  startup -> claim [style=dotted, arrowhead=none];
+
+  claim -> side      [color="#6aa56f"];
+  parse -> side      [color="#6aa56f", style=dashed, label=" rejections", fontcolor="#4a854f"];
+  lww   -> companies [color="#6aa56f"];
+  embed -> companies [color="#6aa56f"];
+  embed -> model     [label=" embed text", style=dashed, color="#9b7ad1", fontcolor="#7b5ab1"];
+
+  companies -> similar [label=" SQL", color="#6aa56f", fontcolor="#4a854f"];
+  companies -> card    [color="#6aa56f"];
+  side      -> health  [color="#6aa56f", style=dashed];
+
+  similar -> portal [label=" JSON", color="#d9a35b", fontcolor="#b9833b", dir=both];
+  card    -> portal [color="#d9a35b", dir=both];
+
+}

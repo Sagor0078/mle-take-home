@@ -6,3 +6,7 @@ __pycache__/
 .pyrefly/
 .env
 .DS_Store
+
+# Superpowers working files: design specs, plans and execution scratch (kept locally, not published)
+.superpowers/
+docs/superpowers/

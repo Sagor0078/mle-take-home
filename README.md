@@ -188,7 +188,7 @@ alembic.ini   Alembic settings (the database URL comes from DATABASE_URL)
 migrations/   Alembic env.py; versions/0001_init.py, 0002_embedding_inline.py (plain SQL)
 ui/           optional Streamlit test UI for the API (`just ui`); client.py is the HTTP client
 tests/        unit tests for parsing/text/embedding/UI client; integration tests against Postgres and RabbitMQ
-docs/         system-design.png (+ .dot source); superpowers/ holds the design specs and implementation plans
+docs/         system-design.png (+ .dot source)
 DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use
 ```
 

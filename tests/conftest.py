@@ -1,12 +1,14 @@
 import uuid
 
 import psycopg
+import pytest
 import pytest_asyncio
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
 from app.config import Settings
 from app.db import make_pool
+from app.embedding import FakeEmbedder
 from app.migrate import migrate
 
 
@@ -53,3 +55,9 @@ async def clean_db(pool):
         if tables:
             names = sql.SQL(", ").join(sql.Identifier(t) for t in tables)
             await conn.execute(sql.SQL("TRUNCATE {} RESTART IDENTITY").format(names))
+
+
+@pytest.fixture
+def embedder():
+    """Deterministic offline embedder; tests never download a model."""
+    return FakeEmbedder()

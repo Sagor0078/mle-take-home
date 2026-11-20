@@ -3,8 +3,14 @@
 ## Running the solution
 
 This repo now contains a consumer that reads `company-events` into Postgres/pgvector and a FastAPI service that
-returns similar companies. Why it is built this way, what was assumed, how it is tested and what is left are in
-[`DESIGN.md`](DESIGN.md). The original assignment text is kept unchanged [below](#the-assignment-original-brief).
+returns similar companies, plus an optional Streamlit page for trying the API. Why it is built this way, what was
+assumed, how it is tested and what is left are in [`DESIGN.md`](DESIGN.md). The original assignment text is kept
+unchanged [below](#the-assignment-original-brief).
+
+![System design: registry feed → RabbitMQ → consumer (claim, parse, per-field last-writer-wins, embed, ack) → Postgres + pgvector → similar-companies API → portal](docs/system-design.png)
+
+The diagram is generated from [`docs/system-design.dot`](docs/system-design.dot)
+(`dot -Tpng -Gdpi=150 docs/system-design.dot -o docs/system-design.png`).
 
 ### Prerequisites
 
@@ -49,7 +55,7 @@ database's revision; `uv run alembic downgrade -1` steps back one revision.
 ### Try it
 
 ```bash
-curl -s localhost:8000/companies/SYN-001550/similar | python -m json.tool
+curl -s localhost:8000/companies/SYN-001550/similar | python -m json.tool   # use your API_PORT if you changed it
 ```
 
 Response from a database filled by the steps above (scores shortened here to 3 decimals; the API returns full floats):
@@ -87,7 +93,7 @@ Other endpoints and cases:
 | any `/companies/...` with Postgres down or not migrated | 503 | `{"error": "database_unavailable"}` within 5 s |
 | `GET /no/such/route` | 404 | `{"error": "not_found"}` |
 
-Interactive docs are at http://localhost:8000/docs.
+Interactive docs are at http://localhost:8000/docs (or your `API_PORT`).
 
 ### Model evaluation and switching models
 
@@ -110,14 +116,16 @@ Results are in [`DESIGN.md` section 2.8](DESIGN.md#28-similarity-search-exact-sc
 
 ```bash
 just serve      # terminal 1: the API
-just ui         # terminal 2: Streamlit test UI on http://localhost:8501
+just ui         # terminal 2: Streamlit test UI on http://localhost:8501 (UI_PORT to change)
 ```
+
+Streamlit is installed only for this command (`uv run --group ui`), so `just setup` stays lean.
 
 The UI (`ui/app.py`, in the optional `ui` dependency group) draws the "Similar companies" panel from the API's JSON:
 pick an example or type a registration number, click a card to open that company, and see each call's status and
 latency. An **Edge cases** tab runs the error paths (unknown company, malformed number, bad `limit`, struck off, no
-description, unknown route) and checks each against the API contract. Point it elsewhere with `API_URL` (or
-`API_PORT`); move it with `UI_PORT`.
+description, unknown route) and checks each against the API contract. It finds the API through `API_PORT` (the same
+variable `just serve` uses) or a full `API_URL`, and the sidebar lets you change the address while it runs.
 
 ### Tests
 
@@ -147,14 +155,27 @@ Everything has a default that matches `docker-compose.yml`. Set variables in you
 | `RABBITMQ_URL` | `amqp://guest:guest@localhost:$RABBITMQ_PORT/` | consumer, producer |
 | `EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | consumer, `just reembed` (any 384-dim fastembed model); API reports it as `model` |
 | `PREFETCH` | `32` | consumer: unacked messages in flight |
-| `API_PORT` | `8000` | `just serve` |
+| `API_PORT` | `8000` | `just serve`, `just bench`, and the UI's default API address |
+| `API_URL` | `http://localhost:$API_PORT` | `just ui`: the API to call |
+| `UI_PORT` | `8501` | `just ui` |
 | `FASTEMBED_CACHE_PATH` | `~/.cache/fastembed` | where downloaded models are kept |
 
-If the default ports are taken on your machine, for example:
+If a default port is taken on your machine (`just up` or `just serve` fails with "address already in use"), put free
+ports in `.env`, for example:
 
 ```bash
-printf 'POSTGRES_PORT=5435\nRABBITMQ_PORT=5673\nRABBITMQ_UI_PORT=15673\n' > .env
+cat > .env <<'ENV'
+POSTGRES_PORT=5435
+RABBITMQ_PORT=5673
+RABBITMQ_UI_PORT=15673
+API_PORT=8765
+UI_PORT=8502
+ENV
 ```
+
+Every `just` command reads it, so `just serve` then listens on 8765 and `just ui` calls it there. Containers already
+running keep their old ports: after changing the compose ports, run `just down && just up` (this deletes the data, so
+consume the feed again).
 
 ### Layout
 
@@ -166,7 +187,8 @@ eval/         model evaluation: metrics.py (pure functions), evaluate.py (`just 
 alembic.ini   Alembic settings (the database URL comes from DATABASE_URL)
 migrations/   Alembic env.py; versions/0001_init.py, 0002_embedding_inline.py (plain SQL)
 ui/           optional Streamlit test UI for the API (`just ui`); client.py is the HTTP client
-tests/        unit tests for parsing/text/embedding; integration tests against Postgres
+tests/        unit tests for parsing/text/embedding/UI client; integration tests against Postgres and RabbitMQ
+docs/         system-design.png (+ .dot source); superpowers/ holds the design specs and implementation plans
 DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use
 ```
 

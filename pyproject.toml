@@ -5,7 +5,28 @@ description = "Turn a company event feed into a similar-companies service with R
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "aio-pika",
+  "fastapi>=0.165.0",
+  "fastembed>=0.9.1",
+  "numpy>=2.5.5",
+  "pgvector>=0.5.1",
+  "psycopg-pool>=3.3.3",
+  "psycopg[binary]>=3.3.9",
+  "uvicorn>=0.54.0",
 ]
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.5.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+pythonpath = ["."]

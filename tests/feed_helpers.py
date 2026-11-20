@@ -7,7 +7,8 @@ from pathlib import Path
 
 from app.ingest import handle_message
 
-FEED_LINES = Path("data/feed.jsonl").read_text(encoding="utf-8").splitlines()
+FEED_PATH = Path(__file__).resolve().parents[1] / "data" / "feed.jsonl"
+FEED_LINES = FEED_PATH.read_text(encoding="utf-8").splitlines()
 
 
 async def replay(pool, embedder, lines: list[str]) -> Counter:
@@ -26,7 +27,7 @@ async def snapshot(conn) -> list[tuple]:
     """Every companies column (embedding as text), ordered by reg_no."""
     cur = await conn.execute(
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_name = 'companies' ORDER BY ordinal_position"
+        "WHERE table_schema = 'public' AND table_name = 'companies' ORDER BY ordinal_position"
     )
     columns = [
         "embedding::text" if name == "embedding" else name for (name,) in await cur.fetchall()

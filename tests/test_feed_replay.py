@@ -20,6 +20,15 @@ async def test_full_feed_counts(pool, embedder, clean_db):
     outcomes = await replay(pool, embedder, FEED_LINES)
 
     assert outcomes == Counter(applied=2433, duplicate=68, rejected=17)
+    async with pool.connection() as conn:
+        cur = await conn.execute("SELECT reason, count(*) FROM rejected_messages GROUP BY reason")
+        reasons = dict(await cur.fetchall())
+    assert reasons == {
+        "missing_registration_number": 7,
+        "invalid_json": 5,
+        "invalid_data": 4,
+        "not_an_object": 1,
+    }
     assert await _scalar(pool, "SELECT count(*) FROM companies") == 2000
     assert await _scalar(pool, "SELECT count(*) FROM companies WHERE NOT active") == 8
     assert await _scalar(pool, "SELECT count(*) FROM companies WHERE embedding IS NULL") == 4

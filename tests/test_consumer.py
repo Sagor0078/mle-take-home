@@ -13,7 +13,8 @@ from app.consumer import on_message
 class FakeMessage:
     """Stands in for aio_pika's incoming message; records ack/nack calls."""
 
-    def __init__(self, body: bytes, message_id: str | None = "m-1"):
+    def __init__(self, body: bytes, message_id: str | None = "m-1", calls: list[str] | None = None):
+        self.calls = calls if calls is not None else []
         self.body = body
         self.message_id = message_id
         self.acked = 0
@@ -23,6 +24,7 @@ class FakeMessage:
         self.acked += 1
 
     async def nack(self, requeue: bool = True) -> None:
+        self.calls.append("nack")
         self.nacks.append(requeue)
 
 
@@ -69,12 +71,15 @@ async def test_transient_error_requeues(pool, clean_db, embedder, monkeypatch):
     async def boom(*args, **kwargs):
         raise psycopg.OperationalError("database went away")
 
+    calls: list[str] = []
+
     async def no_sleep(_seconds):
-        return None
+        calls.append("sleep")
 
     monkeypatch.setattr(consumer, "handle_message", boom)
     monkeypatch.setattr(consumer.asyncio, "sleep", no_sleep)
-    message = FakeMessage(_valid_body())
+    message = FakeMessage(_valid_body(), calls=calls)
     assert await on_message(message, pool, embedder) is None
+    assert calls == ["sleep", "nack"]  # back off while still holding the delivery
     assert message.nacks == [True] and message.acked == 0
     assert await _count(pool, "rejected_messages") == 0

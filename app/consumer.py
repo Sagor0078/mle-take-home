@@ -34,8 +34,10 @@ async def on_message(message: AbstractIncomingMessage, pool, embedder) -> Outcom
     except Exception:
         # Transient (database down, deadlock, ...): the transaction rolled back, so retry later.
         log.exception("transient error on message %s; requeueing", message.message_id)
+        # Sleep before nack: the delivery holds its prefetch slot, so the broker
+        # cannot hand the message straight back while the dependency is down.
+        await asyncio.sleep(RETRY_DELAY_SECONDS)
         await message.nack(requeue=True)
-        await asyncio.sleep(RETRY_DELAY_SECONDS)  # don't spin on a broken dependency
         return None
     await message.ack()  # only after the transaction has committed
     return outcome

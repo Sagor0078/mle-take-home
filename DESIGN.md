@@ -35,9 +35,10 @@ portal ─► FastAPI  GET /companies/{reg}/similar ─► one SQL query: cosine
 | `app/api.py` | FastAPI app: cards, similar companies, health and readiness, JSON errors. |
 | `app/migrate.py` | Applies `migrations/*.sql` once each, tracked in `schema_migrations`. |
 | `app/reembed.py` | `just reembed`: re-embeds every company with the configured model after a model change. |
-| `eval/` | `just eval`: the model comparison in section 6 (`metrics.py` pure functions, `evaluate.py`, `pairs.csv`). |
+| `eval/` | `just eval`: the model comparison in section 6 (`metrics.py` pure functions, `evaluate.py`, `pairs.csv`); `just bench` (`bench.py`) and `just scale-bench` (`scale_bench.py`): the latency numbers in section 2.8. |
 
-No ORM: the SQL is in `app/store.py` and `migrations/001_init.sql`, so what runs against the database is visible.
+No ORM: the SQL is in `app/store.py` and `migrations/` (`001_init.sql`, `002_embedding_inline.sql`), so what runs
+against the database is visible.
 
 ## 2. Decisions
 
@@ -103,13 +104,14 @@ exchange; poison messages go to our own `rejected_messages` table instead.
 |---|---|
 | Valid event | apply in one transaction, commit, **then** ack |
 | Duplicate `message_id` | ack (the transaction only checked the claim) |
-| Permanently invalid | store body + reason in `rejected_messages`, commit, ack. Never requeued. |
+| Permanently invalid (bad body, or a `psycopg.DataError` on the write) | store body + reason in `rejected_messages`, commit, ack. Never requeued. |
 | Any other exception (DB down, deadlock, ...) | transaction rolls back; sleep 1 s, **then** nack with requeue |
 
 Sleeping before the nack is deliberate: the delivery keeps its prefetch slot while we wait, so during a database outage
 the broker cannot hand the same message straight back and the consumer does not spin at full speed. The connection is
 `connect_robust`, so it reconnects after a broker restart. On SIGINT/SIGTERM the consumer cancels its subscription,
-waits for in-flight messages to finish and logs the totals. Correctness does not depend on ordering, so up to
+waits for in-flight messages to finish and logs the totals. The model is loaded before those signal handlers are
+installed, so Ctrl-C during the first-run download stops it at once. Correctness does not depend on ordering, so up to
 `PREFETCH` (32) messages are processed concurrently.
 
 ### 2.6 A hostile body is a rejection, never a crash
@@ -117,9 +119,18 @@ waits for in-flight messages to finish and logs the totals. Correctness does not
 If parsing raised anything other than `InvalidEvent`, the consumer would treat it as transient and requeue it forever.
 So `events.py` turns every way a body can be bad into `InvalidEvent(reason)`: invalid UTF-8, truncated JSON, JSON
 nested deep enough to hit Python's recursion limit, a 5,000-digit timestamp (`int()` refuses it), timestamps out of
-`datetime`'s range (`10**400`, `1e308`), a 400-digit integer registration number. A parametrised test feeds these
-bodies to `parse_event` and checks that nothing but `InvalidEvent` escapes. Reasons: `invalid_json`, `not_an_object`, `unknown_type`, `missing_registration_number`,
-`invalid_registration_number`, `invalid_updated_at`, `invalid_data`.
+`datetime`'s range (`10**400`, `1e308`), a 400-digit integer registration number.
+
+Some bodies are valid JSON to Python but fail at the database write, the same way on every retry: a NUL character
+(raw or `\u0000`) anywhere, which neither `text` nor `jsonb` accepts; a lone surrogate (`\ud800`), which cannot be
+encoded as UTF-8; `NaN` or `Infinity`, which `jsonb` rejects. `parse_event` checks that the payload can be stored
+(`json.dumps(..., allow_nan=False)`, encode, look for `\u0000`) and rejects it as `unstorable` otherwise. As a safety
+net for anything that check misses, `handle_message` treats a `psycopg.DataError` from the write as permanent too: it
+rolls back, then records the message as `unstorable` in a new transaction.
+
+A parametrised test feeds all these bodies to `parse_event` and requires `InvalidEvent` for each. Reasons:
+`invalid_json`, `not_an_object`, `unknown_type`, `missing_registration_number`, `invalid_registration_number`,
+`invalid_updated_at`, `invalid_data`, `unstorable`.
 
 ### 2.7 Embeddings are derived from the stored row
 
@@ -140,6 +151,9 @@ the fields: whatever order events arrive in, the final description is the same, 
 - **Cache:** `embedding_cache (model, sha256(text)) → vector`. The feed has only 178 distinct descriptions for 2,000
   companies, so the model runs a couple of hundred times for the whole feed, not 2,433. Keying on the model means a
   model change never mixes vectors from two models.
+- **178 vs 180:** the feed's 178 distinct descriptions are 173 after cleaning, and some are later replaced, so the
+  final table holds 170 distinct cleaned descriptions. Add 10 `"{industry} business"` fallbacks and the table embeds
+  **180 distinct texts**; that is the number used below wherever "texts" means embedded texts.
 - **Model:** `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` through fastembed (CPU, 384 dimensions,
   ~220 MB), configurable with `EMBED_MODEL`. It replaced the brief's `BAAI/bge-small-en-v1.5` after the comparison in
   section 6. Vectors are L2-normalised; distance is cosine (`<=>`). The model call runs in a worker thread
@@ -160,16 +174,16 @@ LIMIT %(limit)s
 - **Exact, no HNSW index (measured; see "Latency" below).** At 2,000 rows the scan takes ~6 ms, and it is exact,
   which matters because of the next point. An HNSW index orders by distance only, and with a `WHERE active` filter
   it can return fewer than `limit` rows (the filter is applied after the index scan).
-- **Deterministic ties.** 178 distinct texts across 2,000 companies means many identical scores. Ties go to the same
+- **Deterministic ties.** 180 distinct texts across 2,000 companies means many identical scores. Ties go to the same
   industry, then the same state, then `reg_no`, so the panel never shuffles between page loads.
 - **Score** is cosine similarity (1 = identical text).
 
 For the README's mock company SYN-001550 ("Operating cafes and coffee shops in the Klang Valley"), the top four are
 SYN-000539 (identical description, score 1.0), SYN-000263 and SYN-001650 (the Malay translation, 0.950 each), and
 SYN-000344, a coffee shop in Kuantan (0.862). The first three are the mock's three food companies. The mock's fourth
-is a Logistics company; with `bge-small-en-v1.5` we reproduced that (an exact tie at 0.830 between SYN-000700 and the
-mock's SYN-000831, broken by "same state first"), and the multilingual model replaces it with another café
-(section 6).
+is a Logistics company, SYN-000831. With `bge-small-en-v1.5` the fourth is also a Logistics company, but a different
+one: SYN-000700 and SYN-000831 tie exactly at 0.830, and "same state first" picks SYN-000700 (Selangor, like
+SYN-001550). The current default, the multilingual model, gives yet another fourth: SYN-000344, a café (section 6).
 
 #### Latency
 
@@ -187,8 +201,9 @@ companies with `httpx.AsyncClient` at concurrency 10; `just scale-bench` times t
   merge path, which does.
 - **HTTP after the fix: p95 47–101 ms over nine runs** (p50 28–41 ms, p99 60–181 ms, 211–311 req/s), with
   `uvicorn[standard]` (uvloop + httptools). Without it, nine runs gave p95 59–74 ms and 195–262 req/s: it raised
-  throughput and p50 and put p95 under 50 ms in 2 of 9 runs, but its tail is wider, so no clear p95 win. A pool of 10 connections instead of
-  psycopg_pool's 4 lowered p50 (25–28 ms) but made p95 worse (64–104 ms), so the pool stays at 4. **The 50 ms p95
+  throughput, lowered p50 and put p95 under 50 ms in 2 of 9 runs, but its tail is wider, so no clear p95 win. A
+  pool of 10 connections instead of psycopg_pool's 4 lowered p50 (25–28 ms) but made p95 worse (64–104 ms), so the
+  pool stays at 4. **The 50 ms p95
   target is met only in some runs.** The query is not the main cost: the same SQL at concurrency 10 over psycopg has
   p95 7 ms, and the card endpoint (one primary-key lookup, no vectors, same pool) had p95 80–100 ms in the same
   harness. Where the rest goes is probably server and client CPU on a busy laptop (the httpx client used a full
@@ -197,8 +212,8 @@ companies with `httpx.AsyncClient` at concurrency 10; `just scale-bench` times t
 - **Decision: keep the exact scan.** It orders in SQL, ties included, so the tie-break order always holds. HNSW with
   `hnsw.iterative_scan = relaxed_order`, a 4x over-fetch and a Python re-sort on the same keys returns equally close
   neighbours (the top-4 scores matched on 100% of queries at 2k), but only 63% of the same companies: a group of
-  identical descriptions larger than the over-fetch (16) is cut arbitrarily (changes when the index is rebuilt), so the panel would differ from the exact
-  one. At 2k it saves ~4 ms of a ~50 ms request.
+  identical descriptions larger than the over-fetch (16) is cut arbitrarily (changes when the index is rebuilt), so
+  the panel would differ from the exact one. At 2k it saves ~4 ms of a ~50 ms request.
 
 | companies | exact p50 / p95 | HNSW + re-sort p50 / p95 | HNSW build | recall@4 (same companies / same scores) |
 |---|---|---|---|---|
@@ -216,9 +231,16 @@ distances all equal the exact top 4 (all or nothing per query).
 ### 2.9 API errors are JSON with an `error` key
 
 The portal should never get an HTML stack trace. Every non-200 response is JSON with an `error` code (table in
-section 4). Validation errors are 422 (FastAPI's default status, with its body rewritten to the same shape), a
-database that cannot be reached is 503. Registration numbers in the path are normalised exactly like the feed's, so
-`syn-001550` works.
+section 4). Validation errors are 422 (FastAPI's default status, with its body rewritten to the same shape). Any
+`psycopg` error, including a schema that is not migrated yet, and a pool timeout are 503 `database_unavailable`; an
+unknown route or method gets `not_found` / `method_not_allowed`; anything else is 500 `internal_error` (uvicorn still
+logs the traceback). Registration numbers in the path are normalised exactly like the feed's, so `syn-001550` works.
+
+A request waits at most **5 s** for a database connection (`API_POOL_TIMEOUT_SECONDS`; psycopg_pool's default is
+30 s), so with Postgres down the portal gets a 503 quickly instead of hanging. The API opens its pool without waiting
+for it to connect, so `just serve` starts even while Postgres is down and `/readyz` reports `not_ready` until it is
+back. The consumer and `just reembed` keep the 30 s default and wait for the database at start-up: they cannot do
+anything without it, and a slow connection under load should not turn into a requeue.
 
 ## 3. Assumptions
 
@@ -278,55 +300,62 @@ A card is `{registrationNumber, name, industry, state, status}` with `status` `"
 | Unknown registration number | 404 | `{"error": "company_not_found"}` |
 | Malformed registration number | 422 | `{"error": "invalid_registration_number"}` |
 | Bad query parameter (`limit=50`) | 422 | `{"error": "invalid_request", "detail": [...]}` |
-| Database unreachable / pool timeout | 503 | `{"error": "database_unavailable"}` |
+| Database unreachable, pool timeout (5 s), or schema not migrated | 503 | `{"error": "database_unavailable"}` |
+| Unknown route / wrong method | 404 / 405 | `{"error": "not_found"}` / `{"error": "method_not_allowed"}` |
+| Unexpected server error | 500 | `{"error": "internal_error"}` |
 
 Struck-off and no-description return 200 with an empty list rather than an error, so the portal can always render
 the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 143 tests in about two to three minutes. Integration tests use the docker-compose Postgres (with pgvector) and a
-throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is unreachable. No test downloads a model.
+`just test` runs 161 tests in about two to three minutes. Integration tests use the docker-compose Postgres (with
+pgvector) and a throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is
+unreachable or another consumer (a running `just consume`) is attached to `company-events`. No test downloads a
+model.
 
 | File | What it shows |
 |---|---|
-| `tests/test_events.py` | One test per feed trap in section 3: reg. no. forms, every timestamp form, truncated JSON, invalid UTF-8, raw control characters, non-object bodies, unknown/missing type, string `data`, "Unknown" names, blank fields, state mapping, extra keys. Hostile bodies (huge digit strings, deep nesting) raise only `InvalidEvent`. |
+| `tests/test_events.py` | One test per feed trap in section 3: reg. no. forms, every timestamp form, truncated JSON, invalid UTF-8, raw control characters, non-object bodies, unknown/missing type, string `data`, "Unknown" names, blank fields, state mapping, extra keys. Hostile bodies (huge digit strings, deep nesting, NUL, lone surrogates, NaN) all raise `InvalidEvent`; unstorable ones with reason `unstorable`. |
 | `tests/test_text.py` | Repeated-phrase collapse (and no collapse of a partial repeat); description vs fallback vs nothing. |
-| `tests/test_embedding.py` | The fake embedder is deterministic, normalised and finite on empty text; `text_hash`. |
+| `tests/test_embedding.py` | The fake embedder is deterministic, normalised and finite on empty text; `text_hash`; the model cache directory (`~/.cache/fastembed`, or `FASTEMBED_CACHE_PATH`). |
 | `tests/test_migrate.py` | Migrations are idempotent; tables exist; embeddings use `STORAGE MAIN` (kept in the row). |
-| `tests/test_store.py` | The merge rules one scenario at a time: older event does not overwrite; older *full* event after a newer partial fills the missing fields; untimed events only fill empty fields; ties broken by `message_id` in byte order (both arrival orders); strike-off hides; stale upsert does not resurrect; newer upsert revives; strike-off before any upsert; fallback embedding, its replacement, and none at all; the embedding follows the final description; the cache is shared; two concurrent copies of one message apply once; `embedding_source` is the same in both arrival orders. |
+| `tests/test_store.py` | The merge rules one scenario at a time: older event does not overwrite; older *full* event after a newer partial fills the missing fields; untimed events only fill empty fields; ties broken by `message_id` in byte order (both arrival orders); strike-off hides; stale upsert does not resurrect; newer upsert revives; strike-off before any upsert; fallback embedding, its replacement, and none at all; the embedding follows the final description; the cache is shared; two concurrent copies of one message apply once; `embedding_source` is the same in both arrival orders; NUL and NaN bodies are rejected as `unstorable`, and so is a message whose write raises `psycopg.DataError`. |
 | `tests/test_feed_replay.py` | The whole feed through `handle_message`, with up to a pool's worth of messages in flight like the consumer: exact counts and rejection reasons; **order independence**: three random shuffles, each plus 500 redelivered messages, produce a `companies` table identical to the in-order run in every column, including the embedding vectors; replaying the feed twice gives 2,518 duplicates and no change. |
-| `tests/test_api.py` | Most similar first; self excluded; struck-off companies excluded; `limit` honoured and validated; deterministic order on ties; `syn-…` normalised; 404, 422; card for an active and a struck-off company; empty list with `no_description`; 503 when the database is down; `/healthz` and `/readyz`. |
+| `tests/test_api.py` | Most similar first; self excluded; struck-off companies excluded; `limit` honoured and validated; deterministic order on ties; `syn-…` normalised; 404, 422; card for an active and a struck-off company; empty list with `no_description`; 503 when the database is down or not migrated; 500 JSON for an unexpected error; JSON 404/405 for unknown routes; with Postgres unreachable the app still starts, `/readyz` is 503 and requests get a 503 within the pool timeout; `/healthz` and `/readyz`. |
 | `tests/test_eval_metrics.py` | The evaluation metrics on hand-built vectors: perfect clusters give precision 1.0; known ranks give exact recall and MRR; identical texts and the query itself are skipped; ties count against the target. |
 | `tests/test_reembed.py` | `reembed` moves every embedding to a new model (a `FakeEmbedder` subclass with another `model_name`) and is a no-op with the same model. |
 | `tests/test_consumer.py` | `on_message`: valid → ack; poison → recorded and acked; no `message_id` → body hash; transient error → sleep, then nack with requeue, nothing recorded. |
-| `tests/test_consumer_rabbitmq.py` | Real broker: the feed published to `company-events` and drained by `run` gives the same `companies` table (every column) and rejection counts as a direct replay; publishing it again changes nothing. |
+| `tests/test_consumer_rabbitmq.py` | Real broker: the feed published to `company-events` and drained by `run` gives the same `companies` table (every column) and rejection counts as a direct replay; publishing it again changes nothing. Skips if another consumer is attached to the queue. |
 
 The order-independence test is the one that matters most: it checks the property the design is built around, on the
 real feed, rather than the cases I thought of.
 
 The full path through RabbitMQ (`just consume` + `just publish` twice, Ctrl-C) was run by hand with the real model:
-`applied=2433 duplicate=68 rejected=17`, then all 2,518 duplicates, then a clean shutdown. `tests/test_consumer_rabbitmq.py`
-now automates this against the dev broker with the fake embedder.
+`applied=2433 duplicate=68 rejected=17`, then all 2,518 duplicates, then a clean shutdown.
+`tests/test_consumer_rabbitmq.py` now automates this against the dev broker with the fake embedder.
 
 ## 6. Recommendation quality
 
-**Question.** 73 of the 180 distinct texts are Malay. Does the brief's English model, `BAAI/bge-small-en-v1.5`, put a
-Malay company next to English companies in the same business, or only next to other Malay text? `just eval`
-(`eval/evaluate.py`, metrics in `eval/metrics.py`) compares it with `paraphrase-multilingual-MiniLM-L12-v2` (also
-384 dimensions, both through fastembed) and the hashed bag of words as a floor.
+**Question.** 73 of the 180 distinct embedded texts are Malay. Does the brief's English model,
+`BAAI/bge-small-en-v1.5`, put a Malay company next to English companies in the same business, or only next to other
+Malay text? `just eval` (`eval/evaluate.py`, metrics in `eval/metrics.py`) compares it with
+`paraphrase-multilingual-MiniLM-L12-v2` (also 384 dimensions, both through fastembed) and the hashed bag of words as a
+floor.
 
 **Method.** The 1,988 active companies that have something to embed, using exactly the text the service embeds
 (`embedding_text`). Each distinct text is embedded once per model; similarity is cosine.
 
 - **Industry P@4.** For each company with an industry, the share of its 4 nearest neighbours in the same industry; a
   neighbour without an industry counts as a miss. Industry is a proxy: it says "same sector", not "good
-  recommendation". Reported twice. *All neighbours* is what the panel shows, but most descriptions are shared by 20–40
-  companies, so the top 4 are mostly exact copies, which always share an industry in this data: it measures the
-  duplicates, not the model. *Other texts* skips neighbours whose text is identical to the company's, so it asks
-  whether the nearest *different* description is in the same sector. I kept every company (rather than collapsing to
-  180 texts) so a description weighs as often as it is shown; each text maps to one industry here, so collapsing
-  would only reweight. "Random neighbours" is the chance level.
+  recommendation". Reported twice. *All neighbours* is what the panel shows, but most companies share their
+  description with 20–40 others (two thirds of them; the median text is shared by 4.5 companies), so the top 4 are
+  mostly exact copies, which share an industry wherever both have one (102 active companies have no industry, and 59
+  of the 180 texts are held by companies with and without one): it measures the duplicates, not the model. *Other
+  texts* skips neighbours whose text is identical to the company's, so it asks whether the nearest *different*
+  description is in the same sector. I kept every company (rather than collapsing to 180 texts) so a description
+  weighs as often as it is shown; no text maps to two different industries here, so collapsing would only reweight.
+  "Random neighbours" is the chance level.
 - **Malay↔English pairs** (`eval/pairs.csv`, 30 pairs: 24 without a town, 6 with one). For each Malay text, the rank
   of its English counterpart among all 180 distinct texts (the query itself excluded), and the reverse. Recall@1,
   recall@5, MRR. A tie with the counterpart counts against it.
@@ -344,7 +373,7 @@ Malay company next to English companies in the same business, or only next to ot
 **What the numbers say.**
 
 - **bge-small-en does not cross languages.** A Malay description finds its English counterpart first in 1 of 30
-  cases (median rank 84 of 179), barely better than the bag of words. A one-off check (Malay detected by the
+  cases (median rank 85 of 179), barely better than the bag of words. A one-off check (Malay detected by the
   descriptions' leading word; not part of `just eval`) shows why: 97% of the 4 nearest neighbours of a Malay text are
   other Malay texts, whatever the business. For the multilingual model it is 60%.
 - **The multilingual model does.** 25 of 30 counterparts rank first and 29 of 30 in the top 5, in both directions.
@@ -356,7 +385,8 @@ Malay company next to English companies in the same business, or only next to ot
   every model, including the bag of words, which confirms it measures duplicates.
 - **SYN-001550:** both models give the same first three (the exact copy, then two Malay translations at 0.834 with
   bge, 0.950 multilingual). bge's fourth is a Logistics parcel-delivery company that shares only "the Klang Valley"
-  (as in the mock); the multilingual model's is a café in Kuantan.
+  (as in the mock, though the tie-break picks a different such company, section 2.8); the multilingual model's is a
+  café in Kuantan.
 - **Cost:** both embed in under 10 ms per text, and thanks to the cache only ~180 texts are ever embedded, so speed
   does not decide. The multilingual model is ~220 MB on disk instead of ~67 MB, and truncates at 128 tokens; the
   longest cleaned description is 11 words.
@@ -412,7 +442,9 @@ change. These are the changes in the order I would make them as volume grows.
 7. **Model swaps without downtime.** The cache is keyed by model and each row records `embedding_model`.
    `just reembed` exists but works in place: while it runs (15 s for 2,000 companies) the table holds two models'
    vectors and similarity across them is meaningless. At scale, write the new vectors to a second column, backfill,
-   then switch the API's query; or filter on `embedding_model` during the switch.
+   then switch the API's query; or filter on `embedding_model` during the switch. Note that the API's `model` field
+  reports the API's own `EMBED_MODEL` setting, not the `embedding_model` stored on the rows, so during (or after a
+  forgotten) re-embed it can name a model the vectors did not come from.
 
 ## 8. What's left
 
@@ -423,20 +455,20 @@ Being honest about what is not done or not proven:
 - **HTTP p95 at concurrency 10 is 47–101 ms on the laptop, so the 50 ms target is met only in some runs** (section
   2.8). The query is 6–7 ms; the rest is probably server and client CPU on a busy laptop, not isolated. Tried:
   uvloop + httptools (kept: more throughput, no clear p95 change) and a 10-connection pool (worse tail, reverted).
-  Untested: a client on another machine, and several uvicorn workers; a quick 4-worker try was slower (~50 ms even at concurrency 1,
-  which looks like a TCP delayed-ACK stall) and I did not diagnose it.
+  Untested: a client on another machine, and several uvicorn workers; a quick 4-worker try was slower (~50 ms even
+  at concurrency 1, which looks like a TCP delayed-ACK stall) and I did not diagnose it.
 - **The RabbitMQ end-to-end test uses the fake embedder and the shared dev queue.** It purges `company-events`, so it
-  must not run against a broker holding real traffic; real-model runs were verified by hand only.
+  must not run against a broker holding real traffic (it skips while another consumer is attached, but cannot tell
+  queued work from a stopped consumer); real-model runs were verified by hand only.
 - **Shutdown race window.** `run()` counts a message as in flight when its handler starts. A delivery handed over
   between cancelling the subscription and that first line could be cut off at shutdown. The broker redelivers it
   (it was never acked) and the dedupe makes that safe, so the cost is one redelivery, not data loss.
 - **The rejection log line lacks the reason.** The consumer logs `rejected message <id>`; the reason is only in
   `rejected_messages`. `handle_message` should return it.
-- **Untested error paths:** `/readyz` returning 503, and the `PoolTimeout` → 503 handler (the `OperationalError` →
-  503 path is tested).
-- **No retry limit for transient errors.** A message that fails for a non-validation reason on every attempt (a bug,
-  say) is requeued every second forever. A retry counter (a classic queue does not count redeliveries, so a table keyed on `message_id`)
-  that parks it in `rejected_messages` after N attempts would fix that.
+- **No retry limit for transient errors.** A message that fails on every attempt for a reason other than a bad body
+  or a `DataError` (a bug, say) is requeued every second forever. A retry counter (a classic queue does not count
+  redeliveries, so a table keyed on `message_id`) that parks it in `rejected_messages` after N attempts would fix
+  that.
 - **Unknown states are logged once per event**, which would be noisy if a source started sending a new spelling.
 - **No metrics.** Counts are in logs only; a production version wants applied/duplicate/rejected/requeued counters,
   queue depth, and the age of the newest applied event.

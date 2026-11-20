@@ -9,12 +9,14 @@ returns similar companies. Why it is built this way, what was assumed, how it is
 ### Prerequisites
 
 - Docker, [uv](https://docs.astral.sh/uv/) and [just](https://github.com/casey/just), as in the original brief.
+- Linux or Apple-silicon macOS 14+ (onnxruntime, which fastembed needs, has no Intel-mac wheel for Python 3.14).
 - A **final** Python 3.14 release. Older uv versions install 3.14.0rc2, on which pydantic (and so FastAPI) fails to
   import. If `uv run python --version` prints an `rc`, run `uv self update && uv python install 3.14`, then
   `rm -rf .venv && just setup`. Tested with uv 0.13.9 and Python 3.14.10.
 - About 250 MB of free disk and network access the first time the consumer starts: it downloads the embedding model
   `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (~220 MB) through fastembed. It was chosen over
   `BAAI/bge-small-en-v1.5` by a measured comparison ([`DESIGN.md` section 6](DESIGN.md#6-recommendation-quality)).
+  Models are cached in `~/.cache/fastembed` (set `FASTEMBED_CACHE_PATH` to change it), so this happens once.
 
 ### Run it
 
@@ -79,6 +81,8 @@ Other endpoints and cases:
 | `GET /companies/SYN-999999/similar` | 404 | `{"error": "company_not_found"}` |
 | `GET /companies/hello/similar` | 422 | `{"error": "invalid_registration_number"}` |
 | `GET /healthz`, `GET /readyz` | 200 / 503 | process up; database reachable and migrated |
+| any `/companies/...` with Postgres down or not migrated | 503 | `{"error": "database_unavailable"}` within 5 s |
+| `GET /no/such/route` | 404 | `{"error": "not_found"}` |
 
 Interactive docs are at http://localhost:8000/docs.
 
@@ -103,7 +107,7 @@ Results are in [`DESIGN.md` section 2.8](DESIGN.md#28-similarity-search-exact-sc
 
 ```bash
 just up         # Postgres is required; without RabbitMQ the end-to-end tests skip
-just test       # 143 tests, about two to three minutes
+just test       # 161 tests, about two to three minutes
 ```
 
 Stop `just consume` before `just test`: the end-to-end tests publish to and purge `company-events` (they skip if
@@ -128,6 +132,7 @@ Everything has a default that matches `docker-compose.yml`. Set variables in you
 | `EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | consumer, `just reembed` (any 384-dim fastembed model); API reports it as `model` |
 | `PREFETCH` | `32` | consumer: unacked messages in flight |
 | `API_PORT` | `8000` | `just serve` |
+| `FASTEMBED_CACHE_PATH` | `~/.cache/fastembed` | where downloaded models are kept |
 
 If the default ports are taken on your machine, for example:
 

@@ -21,7 +21,7 @@ async def reembed(pool: AsyncConnectionPool, embedder: Embedder) -> int:
         reg_nos = [row[0] for row in await cur.fetchall()]
     for reg_no in reg_nos:
         async with pool.connection() as conn, conn.transaction():
-            # Lock the row like the consumer does, so a concurrent update cannot interleave.
+            # Lock the row so a concurrent consumer update waits for us.
             await conn.execute("SELECT 1 FROM companies WHERE reg_no = %s FOR UPDATE", (reg_no,))
             await refresh_embedding(conn, reg_no, embedder)
     return len(reg_nos)

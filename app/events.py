@@ -81,9 +81,9 @@ def parse_timestamp(value: object) -> datetime | None:
         return None
     if isinstance(value, bool):
         raise InvalidEvent("invalid_updated_at")
-    if isinstance(value, str) and value.isascii() and value.isdigit():
-        value = int(value)
     try:
+        if isinstance(value, str) and value.isascii() and value.isdigit():
+            value = int(value)  # ValueError for absurdly long digit strings
         if isinstance(value, (int, float)):
             seconds = value / 1000 if abs(value) >= MILLISECOND_THRESHOLD else value
             return datetime.fromtimestamp(seconds, UTC)
@@ -133,7 +133,7 @@ def parse_event(body: bytes) -> CompanyEvent:
     """Parse a raw message body into a CompanyEvent or raise InvalidEvent."""
     try:
         payload = json.loads(body.decode("utf-8"), strict=False)
-    except ValueError:  # includes UnicodeDecodeError and JSONDecodeError
+    except (ValueError, RecursionError):  # includes UnicodeDecodeError, JSONDecodeError, too-deep nesting
         raise InvalidEvent("invalid_json") from None
     if not isinstance(payload, dict):
         raise InvalidEvent("not_an_object")

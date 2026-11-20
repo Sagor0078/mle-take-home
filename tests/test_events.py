@@ -202,3 +202,31 @@ def test_struck_off_has_empty_fields():
 
 def test_non_string_field_is_absent():
     assert parse_event(event(data={"natureOfBusiness": 42})).fields.nature is None
+
+
+def test_huge_digit_string_timestamp_rejected():
+    with pytest.raises(InvalidEvent) as exc:
+        parse_timestamp("9" * 5000)
+    assert exc.value.reason == "invalid_updated_at"
+
+
+HOSTILE_BODIES = [
+    event(registrationNumber="9" * 5000),
+    event(updatedAt="9" * 5000),
+    event(updatedAt=10**400),
+    event(updatedAt=1e308),
+    event(registrationNumber=10**400),
+    b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": ' + b"[" * 100000 + b"]" * 100000 + b"}",
+    b'{"type": "company-upserted", "registrationNumber": "SYN-000001", "data": ' + b'{"a":' * 100000 + b"1" + b"}" * 100000 + b"}",
+    event(data=["a", "b"]),
+    b"\xff\xfe\x00",
+    b"",
+]
+
+
+@pytest.mark.parametrize("body", HOSTILE_BODIES)
+def test_parse_event_only_raises_invalid_event(body):
+    try:
+        parse_event(body)
+    except InvalidEvent:
+        pass

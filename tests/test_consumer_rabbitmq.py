@@ -50,7 +50,8 @@ async def management_url(rabbitmq_url):
     url = f"http://localhost:{port}/api/queues/%2F/{QUEUE}"
     try:
         async with httpx.AsyncClient(auth=("guest", "guest"), timeout=3) as client:
-            await client.get(url)
+            response = await client.get(url)
+            response.raise_for_status()
     except httpx.HTTPError as exc:
         pytest.skip(f"RabbitMQ management API unreachable at {url}: {exc!r}")
     return url
@@ -58,7 +59,14 @@ async def management_url(rabbitmq_url):
 
 @pytest_asyncio.fixture(autouse=True)
 async def purged_queue(rabbitmq_url):
-    """Start and finish each test with an empty queue."""
+    """Start and finish each test with an empty queue.
+
+    Skips if anything else consumes `company-events` (e.g. a running `just consume`): the broker
+    would hand it some of our messages, and the purge would delete its queued work.
+    Checked per test, so a consumer started mid-session is caught too.
+    """
+    if await _consumer_count(rabbitmq_url) > 0:
+        pytest.skip("another consumer is attached to company-events; stop `just consume` first")
     await _purge_queue(rabbitmq_url)
     yield
     await _purge_queue(rabbitmq_url)
@@ -81,6 +89,19 @@ async def _purge_queue(url: str) -> None:
         channel = await connection.channel()
         queue = await channel.declare_queue(QUEUE, durable=True)  # same declaration as the app
         await queue.purge()
+
+
+async def _consumer_count(url: str) -> int:
+    """Consumers attached to the queue right now.
+
+    Asked over AMQP rather than the management API, whose numbers lag by a few seconds and
+    would still count the consumer the previous test just stopped.
+    """
+    connection = await aio_pika.connect_robust(url)
+    async with connection:
+        channel = await connection.channel()
+        queue = await channel.declare_queue(QUEUE, durable=True)  # same declaration as the app
+        return queue.declaration_result.consumer_count
 
 
 async def _queue_stats(management_url: str) -> tuple[int, int]:

@@ -106,6 +106,9 @@ just up         # Postgres is required; without RabbitMQ the end-to-end tests sk
 just test       # 143 tests, about two to three minutes
 ```
 
+Stop `just consume` before `just test`: the end-to-end tests publish to and purge `company-events` (they skip if
+another consumer is attached).
+
 The tests create a throwaway database `companies_test_<hex>` on the same Postgres server and drop it at the end, so
 they do not touch the `companies` database. They never download a model: they use a deterministic hashed
 bag-of-words embedder. What each test file covers is in [`DESIGN.md`](DESIGN.md#5-testing).

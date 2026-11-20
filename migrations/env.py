@@ -18,8 +18,9 @@ MIGRATION_LOCK_ID = 7_241_983
 
 config = context.config
 
-# Only when run from the CLI with alembic.ini; never disable loggers the app already configured.
-if config.config_file_name is not None:
+# Logging from alembic.ini only for the `alembic` CLI. When the app migrates (app.migrate sets
+# configure_logger=False), fileConfig() would reset the root logger to WARNING and hide its INFO lines.
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
     fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 

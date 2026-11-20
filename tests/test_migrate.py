@@ -7,6 +7,7 @@ import sys
 import psycopg
 import pytest
 from alembic import command
+from sqlalchemy.engine import make_url
 
 from app.migrate import ROOT, alembic_config, head_revision, is_at_head, sqlalchemy_url, upgrade_to_head
 
@@ -46,6 +47,14 @@ def assert_full_schema(url: str) -> None:
 )
 def test_sqlalchemy_url_variants(raw):
     assert sqlalchemy_url(raw) == "postgresql+psycopg://u:p@h:1/d"
+
+
+@pytest.mark.parametrize(
+    "raw", ["host=/var/run/postgresql dbname=d user=u", "postgresql://u@/d?host=/var/run/postgresql"]
+)
+def test_sqlalchemy_url_unix_socket(raw):
+    url = make_url(sqlalchemy_url(raw))
+    assert (url.host, url.database, url.query.get("host")) == (None, "d", "/var/run/postgresql")
 
 
 def test_sqlalchemy_url_from_keyword_conninfo():
@@ -98,8 +107,16 @@ async def test_is_at_head_false_without_alembic_version(fresh_db_url):
         assert not await is_at_head(conn)
 
 
-def test_upgrade_keeps_app_loggers_enabled(fresh_db_url):
-    # Alembic's fileConfig() disables existing loggers by default, which would silence the consumer.
-    log = logging.getLogger("app.consumer")
-    upgrade_to_head(fresh_db_url)
-    assert not log.disabled
+def test_upgrade_keeps_app_logging(fresh_db_url):
+    # The consumer configures INFO logging, then migrates. Alembic's ini logging must not touch it:
+    # fileConfig() would reset the root logger to WARNING and silence the consumer's running totals.
+    root = logging.getLogger()
+    before = (root.level, list(root.handlers))
+    root.setLevel(logging.INFO)
+    try:
+        upgrade_to_head(fresh_db_url)
+        assert root.level == logging.INFO
+        assert logging.getLogger("consumer").isEnabledFor(logging.INFO)
+    finally:
+        root.setLevel(before[0])
+        root.handlers[:] = before[1]

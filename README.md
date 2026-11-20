@@ -110,7 +110,7 @@ Results are in [`DESIGN.md` section 2.8](DESIGN.md#28-similarity-search-exact-sc
 
 ```bash
 just up         # Postgres is required; without RabbitMQ the end-to-end tests skip
-just test       # 171 tests, about four minutes
+just test       # 173 tests, about three to four minutes
 ```
 
 Stop `just consume` before `just test`: the end-to-end tests publish to and purge `company-events` (they skip if

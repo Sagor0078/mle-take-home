@@ -22,11 +22,15 @@ def sqlalchemy_url(database_url: str) -> str:
     if database_url.startswith("postgresql+psycopg://"):
         return database_url
     params = conninfo_to_dict(database_url)
+    host = params.pop("host", None)
+    if host and str(host).startswith("/"):
+        params["host"] = host  # a unix-socket directory goes in the query string, not the URL's host
+        host = None
     url = URL.create(
         "postgresql+psycopg",
         username=params.pop("user", None),
         password=params.pop("password", None),
-        host=params.pop("host", None),
+        host=host,
         port=int(params["port"]) if "port" in params else None,
         database=params.pop("dbname", None),
         query={k: str(v) for k, v in params.items() if k != "port"},
@@ -40,6 +44,8 @@ def alembic_config(database_url: str) -> Config:
     config.set_main_option("script_location", str(ROOT / "migrations"))
     # ConfigParser treats % as interpolation; escape it in case the password contains one.
     config.set_main_option("sqlalchemy.url", sqlalchemy_url(database_url).replace("%", "%%"))
+    # Called from inside the app: leave the app's logging alone (env.py skips alembic.ini's).
+    config.attributes["configure_logger"] = False
     return config
 
 

@@ -257,8 +257,10 @@ connection Alembic needs while migrating; the app itself keeps async psycopg.
   processes against an empty database; it fails without the lock.
 - **Readiness.** `/readyz` is 200 only when `alembic_version` matches the newest revision, so an API started against a
   database that is behind reports `not_ready`.
-- **Logging.** Alembic's `fileConfig` would disable loggers configured before it runs (the consumer's); `env.py` passes
-  `disable_existing_loggers=False`, and a test checks it.
+- **Logging.** `alembic.ini`'s logging config is applied only for the `alembic` command line. When the app migrates
+  (`app.migrate` sets `configure_logger = False`), `env.py` skips it: `fileConfig` would reset the root logger to
+  WARNING and hide the consumer's INFO lines (its running totals). A test configures INFO logging, migrates, and
+  checks the consumer still logs at INFO.
 - **Downgrades** drop what a revision created. `0001_init`'s downgrade leaves the `vector` extension installed, since
   other objects in the database may use it.
 
@@ -329,7 +331,7 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 171 tests in about four minutes. Integration tests use the docker-compose Postgres (with
+`just test` runs 173 tests in about three to four minutes. Integration tests use the docker-compose Postgres (with
 pgvector) and a throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is
 unreachable or another consumer (a running `just consume`) is attached to `company-events`. No test downloads a
 model.

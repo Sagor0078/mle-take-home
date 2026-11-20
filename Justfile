@@ -50,3 +50,7 @@ bench:
 # Exact scan vs HNSW at 2k/20k/200k companies, in a throwaway database (a few minutes).
 scale-bench:
     uv run python -m eval.scale_bench
+
+# Streamlit UI for trying the API by hand (needs `just serve`; API_URL or API_PORT points it, UI_PORT moves it).
+ui:
+    PYTHONPATH=. uv run --group ui streamlit run ui/app.py --server.headless true --server.port ${UI_PORT:-8501}

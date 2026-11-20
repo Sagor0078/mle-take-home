@@ -331,7 +331,7 @@ the page and simply hide the panel.
 
 ## 5. Testing
 
-`just test` runs 173 tests in about three to four minutes. Integration tests use the docker-compose Postgres (with
+`just test` runs 179 tests in about three to four minutes. Integration tests use the docker-compose Postgres (with
 pgvector) and a throwaway database per test session; the RabbitMQ end-to-end tests skip when the broker is
 unreachable or another consumer (a running `just consume`) is attached to `company-events`. No test downloads a
 model.

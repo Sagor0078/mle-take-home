@@ -106,11 +106,24 @@ just scale-bench  # exact scan vs HNSW at 2k/20k/200k companies in a throwaway d
 
 Results are in [`DESIGN.md` section 2.8](DESIGN.md#28-similarity-search-exact-scan).
 
+### Try it in a browser (optional)
+
+```bash
+just serve      # terminal 1: the API
+just ui         # terminal 2: Streamlit test UI on http://localhost:8501
+```
+
+The UI (`ui/app.py`, in the optional `ui` dependency group) draws the "Similar companies" panel from the API's JSON:
+pick an example or type a registration number, click a card to open that company, and see each call's status and
+latency. An **Edge cases** tab runs the error paths (unknown company, malformed number, bad `limit`, struck off, no
+description, unknown route) and checks each against the API contract. Point it elsewhere with `API_URL` (or
+`API_PORT`); move it with `UI_PORT`.
+
 ### Tests
 
 ```bash
 just up         # Postgres is required; without RabbitMQ the end-to-end tests skip
-just test       # 173 tests, about three to four minutes
+just test       # 179 tests, about three to four minutes
 ```
 
 Stop `just consume` before `just test`: the end-to-end tests publish to and purge `company-events` (they skip if
@@ -152,6 +165,7 @@ eval/         model evaluation: metrics.py (pure functions), evaluate.py (`just 
               bench.py (`just bench`), scale_bench.py (`just scale-bench`)
 alembic.ini   Alembic settings (the database URL comes from DATABASE_URL)
 migrations/   Alembic env.py; versions/0001_init.py, 0002_embedding_inline.py (plain SQL)
+ui/           optional Streamlit test UI for the API (`just ui`); client.py is the HTTP client
 tests/        unit tests for parsing/text/embedding; integration tests against Postgres
 DESIGN.md     decisions, assumptions, testing, 10x, what's left, AI-tool use
 ```
